@@ -1,0 +1,112 @@
+name: RL Trainer (Configurable Manual Runner)
+
+on:
+  workflow_dispatch:
+    inputs:
+      algorithm:
+        description: "Choose the RL algorithm"
+        required: true
+        type: choice
+        options:
+          - dqn
+          - ddqn
+        default: "dqn"
+
+      environment:
+        description: "Choose the environment"
+        required: true
+        type: choice
+        options:
+          - lunarlander
+          - cartpole
+        default: "lunarlander"
+
+      total_steps:
+        description: "Total training timesteps"
+        required: true
+        default: "2000000"
+
+      stage_size:
+        description: "Steps per training stage (checkpoint interval)"
+        required: true
+        default: "200000"
+
+      learning_rate:
+        description: "Learning rate for DQN/DDQN"
+        required: false
+        default: "0.0005"
+
+jobs:
+  rl-trainer:
+    runs-on: ubuntu-latest
+    name: RL Training Job
+
+    steps:
+      # Step 1 — Checkout repo
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step 2 — Set up Python
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Step 3 — Install system-level deps (Box2D, etc.)
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y swig
+
+      # Step 4 — Install Python dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+
+      # Step 5 — Determine file name and run training
+      - name: Build training filename and run
+        env:
+          ALGO: ${{ github.event.inputs.algorithm }}
+          ENV_NAME: ${{ github.event.inputs.environment }}
+          TOTAL_STEPS: ${{ github.event.inputs.total_steps }}
+          STAGE_SIZE: ${{ github.event.inputs.stage_size }}
+          LEARNING_RATE: ${{ github.event.inputs.learning_rate }}
+        run: |
+          echo "🚀 Starting RL Training"
+          echo "🧠 Algorithm: $ALGO"
+          echo "🌍 Environment: $ENV_NAME"
+          echo "🔢 Total Steps: $TOTAL_STEPS"
+          echo "📦 Stage Size: $STAGE_SIZE"
+          echo "💡 Learning Rate: $LEARNING_RATE"
+
+          # Dynamically build script filename
+          if [ "$ENV_NAME" = "cartpole" ]; then
+            ENV_VERSION="v1"
+          else
+            ENV_VERSION="v3"
+          fi
+
+          FILE="train_${ALGO}_${ENV_NAME}_${ENV_VERSION}.py"
+          echo "📄 Running training script: $FILE"
+
+          if [ ! -f "$FILE" ]; then
+            echo "❌ ERROR: $FILE not found!"
+            exit 1
+          fi
+
+          PYTHONWARNINGS=ignore python "$FILE" \
+            --total_steps $TOTAL_STEPS \
+            --stage_size $STAGE_SIZE \
+            --lr $LEARNING_RATE > train_log.txt
+
+      # Step 6 — Show last 50 lines of log summary
+      - name: Show Training Summary
+        run: |
+          echo "📊 Final Training Summary (last 50 lines):"
+          tail -n 50 train_log.txt
+
+      # Step 7 — Upload trained model artifact
+      - name: Upload Trained Model
+        uses: actions/upload-artifact@v4
+        with:
+          name: rl-trained-model
+          path: models_v3/
