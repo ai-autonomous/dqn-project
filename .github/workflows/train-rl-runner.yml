@@ -19,6 +19,7 @@ on:
         options:
           - lunarlander
           - cartpole
+          - recsim
         default: "lunarlander"
 
       total_steps:
