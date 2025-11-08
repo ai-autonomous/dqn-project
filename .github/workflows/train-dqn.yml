@@ -1,10 +1,13 @@
 name: Train DQN LunarLander-v3
 
 on:
-  workflow_dispatch:  # run manually
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
   train-dqn:
