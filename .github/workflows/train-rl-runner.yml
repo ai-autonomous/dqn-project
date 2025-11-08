@@ -52,7 +52,7 @@ jobs:
         with:
           python-version: "3.13"
 
-      # Step 3 — Install system-level deps (Box2D, etc.)
+      # Step 3 — Install system-level deps
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y swig
 
@@ -62,8 +62,8 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
 
-      # Step 5 — Determine file name and run training
-      - name: Build training filename and run
+      # Step 5 — Build training filename and execute
+      - name: Run RL Training
         env:
           ALGO: ${{ github.event.inputs.algorithm }}
           ENV_NAME: ${{ github.event.inputs.environment }}
@@ -78,7 +78,6 @@ jobs:
           echo "📦 Stage Size: $STAGE_SIZE"
           echo "💡 Learning Rate: $LEARNING_RATE"
 
-          # Dynamically build script filename
           if [ "$ENV_NAME" = "cartpole" ]; then
             ENV_VERSION="v1"
           else
@@ -86,7 +85,7 @@ jobs:
           fi
 
           FILE="train_${ALGO}_${ENV_NAME}_${ENV_VERSION}.py"
-          echo "📄 Running training script: $FILE"
+          echo "📄 Running script: $FILE"
 
           if [ ! -f "$FILE" ]; then
             echo "❌ ERROR: $FILE not found!"
@@ -98,14 +97,14 @@ jobs:
             --stage_size $STAGE_SIZE \
             --lr $LEARNING_RATE > train_log.txt
 
-      # Step 6 — Show last 50 lines of log summary
+      # Step 6 — Show summary
       - name: Show Training Summary
         run: |
           echo "📊 Final Training Summary (last 50 lines):"
           tail -n 50 train_log.txt
 
-      # Step 7 — Upload trained model artifact
-      - name: Upload Trained Model
+      # Step 7 — Upload model
+      - name: Upload trained model
         uses: actions/upload-artifact@v4
         with:
           name: rl-trained-model

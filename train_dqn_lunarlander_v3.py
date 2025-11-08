@@ -1,7 +1,6 @@
 """
-Configurable DQN training using Stable-Baselines3 (SB3)
-Environment name is passed as input (e.g., LunarLander-v3 or CartPole-v1)
-Supports staged training, checkpointing, and evaluation.
+DQN training script for LunarLander-v3 using Stable-Baselines3 (SB3)
+Now supports CLI inputs for total_steps, stage_size, and learning_rate.
 """
 
 import os
@@ -17,40 +16,35 @@ import warnings
 
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 
-
-# ---------- CLI Arguments ----------
-parser = argparse.ArgumentParser(description="Train DQN on a configurable Gymnasium environment.")
-parser.add_argument("--env", type=str, default="LunarLander-v3", help="Gymnasium environment name")
+# ---------- Parse CLI Arguments ----------
+parser = argparse.ArgumentParser(description="Train DQN on LunarLander-v3 with configurable params.")
 parser.add_argument("--total_steps", type=int, default=2_000_000, help="Total training timesteps")
 parser.add_argument("--stage_size", type=int, default=200_000, help="Steps per training stage")
 parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate for DQN")
 args = parser.parse_args()
 
-
-# ---------- Global Config ----------
-ENV_NAME = args.env
+# ---------- Environment ----------
+ENV_NAME = "LunarLander-v3"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# ---------- Paths ----------
 MODEL_DIR = "models_v3"
-MODEL_BASENAME = f"dqn_{ENV_NAME.replace('-', '_').lower()}"
-MODEL_PATH = os.path.join(MODEL_DIR, f"{MODEL_BASENAME}.zip")
-TB_LOG = f"./tb_{MODEL_BASENAME}"
+MODEL_PATH = os.path.join(MODEL_DIR, "dqn_lunarlander_v3.zip")
+TB_LOG = "./tb_dqn_lunarlander_v3"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-print(f"🚀 Starting DQN training for environment: {ENV_NAME}")
+print(f"🚀 Starting DQN training on {ENV_NAME}")
 print(f"🧠 Device: {DEVICE}")
-print(f"💾 Model path: {MODEL_PATH}")
-print(f"📊 TensorBoard log dir: {TB_LOG}")
+print(f"💡 Total steps: {args.total_steps}, Stage size: {args.stage_size}, LR: {args.lr}")
 
-
-# ---------- Termination Reason Helper ----------
+# ---------- Helper: detect termination reason ----------
 def termination_reason(env, obs):
-    """Detect termination reason for environments like LunarLander."""
+    """Detect why the episode ended in LunarLander-v3."""
     um = env.unwrapped
     try:
         x_pos = float(obs[0])
         game_over = getattr(um, "game_over", False)
-        awake = bool(getattr(um.lander, "awake", True))
+        awake = bool(um.lander.awake)
         if game_over:
             return "CRASH"
         elif abs(x_pos) >= 2.5:
@@ -64,7 +58,7 @@ def termination_reason(env, obs):
         return "DONE"
 
 
-# ---------- Environment Factory ----------
+# ---------- Environment factory ----------
 def make_env(seed=0):
     env = gym.make(ENV_NAME)
     env = Monitor(env)
@@ -73,12 +67,12 @@ def make_env(seed=0):
 
 
 # ---------- Training ----------
-def train_dqn(total_steps=args.total_steps, stage_size=args.stage_size, lr=args.lr):
+def train_dqn(total_steps, stage_size, lr):
     env = make_env(0)
     eval_env = make_env(100)
     policy_kwargs = dict(net_arch=[256, 256])
 
-    # Load or initialize model
+    # Load or initialize
     if os.path.exists(MODEL_PATH):
         print(f"📦 Loading existing model from {MODEL_PATH}")
         model = DQN.load(MODEL_PATH, env=env)
@@ -162,5 +156,5 @@ def evaluate_and_report(model, n_eval_episodes=20, render=False):
 
 # ---------- Main ----------
 if __name__ == "__main__":
-    model = train_dqn()
+    model = train_dqn(args.total_steps, args.stage_size, args.lr)
     evaluate_and_report(model, n_eval_episodes=20, render=False)
