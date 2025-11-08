@@ -1,0 +1,51 @@
+name: Train DQN LunarLander-v3
+
+on:
+  workflow_dispatch:  # run manually
+  push:
+    branches:
+      - main
+
+jobs:
+  train-dqn:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1 — Checkout code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step 2 — Set up Python 3.13
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # Step 3 — Install system-level deps for Box2D
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y swig
+
+      # Step 4 — Install Python deps
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+
+      # Step 5 — Run the DQN training
+      - name: Run DQN LunarLander-v3 Training
+        run: |
+          echo "🚀 Running DQN training on Python $(python --version)"
+          python train_dqn_lunarlander_v3.py > train_log.txt
+
+      # Step 6 — Print final part of the log (summary)
+      - name: Show Training Summary
+        run: |
+          echo "📊 Final Training Summary (last 50 lines):"
+          tail -n 50 train_log.txt
+
+      # Step 7 — Upload model as GitHub artifact
+      - name: Upload trained model
+        uses: actions/upload-artifact@v4
+        with:
+          name: dqn-lunarlander-model
+          path: models_v3/
