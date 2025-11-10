@@ -1,6 +1,7 @@
 """
 DQN training script for LunarLander-v3 using Stable-Baselines3 (SB3)
 Now supports CLI inputs for total_steps, stage_size, and learning_rate.
+Generates reward progression and evaluation summary plots.
 """
 
 import os
@@ -12,6 +13,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 import torch
+import matplotlib.pyplot as plt
 import warnings
 
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
@@ -28,7 +30,7 @@ ENV_NAME = "LunarLander-v3"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ---------- Paths ----------
-MODEL_DIR = "models_v3"
+MODEL_DIR = "models"
 MODEL_PATH = os.path.join(MODEL_DIR, "dqn_lunarlander_v3.zip")
 TB_LOG = "./tb_dqn_lunarlander_v3"
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -72,7 +74,7 @@ def train_dqn(total_steps, stage_size, lr):
     eval_env = make_env(100)
     policy_kwargs = dict(net_arch=[256, 256])
 
-    # Load or initialize
+    # Load or initialize model
     if os.path.exists(MODEL_PATH):
         print(f"📦 Loading existing model from {MODEL_PATH}")
         model = DQN.load(MODEL_PATH, env=env)
@@ -109,6 +111,8 @@ def train_dqn(total_steps, stage_size, lr):
     )
 
     stages = total_steps // stage_size
+    reward_progress = []
+
     for s in range(stages):
         print(f"\n=== 🧠 Stage {s+1}/{stages} → training {stage_size:,} steps ===")
         model.learn(total_timesteps=stage_size, reset_num_timesteps=False, callback=eval_callback)
@@ -116,7 +120,19 @@ def train_dqn(total_steps, stage_size, lr):
         print(f"💾 Saved checkpoint after {stage_size*(s+1):,} total steps")
 
         mean_r, std_r = evaluate_policy(model, eval_env, n_eval_episodes=10)
+        reward_progress.append(mean_r)
         print(f"📈 Evaluation after {stage_size*(s+1):,} steps: mean={mean_r:.2f} ± {std_r:.2f}")
+
+    # Plot training reward trend
+    plt.figure(figsize=(8, 4))
+    plt.plot(np.arange(1, stages + 1), reward_progress, marker="o")
+    plt.title("📈 DQN Training Progress on LunarLander-v3")
+    plt.xlabel("Training Stage")
+    plt.ylabel("Mean Reward")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(MODEL_DIR, "training_reward_plot.png"))
+    print(f"📊 Saved training progress plot to {MODEL_DIR}/training_reward_plot.png")
 
     print("✅ Training complete!")
     env.close()
@@ -152,6 +168,18 @@ def evaluate_and_report(model, n_eval_episodes=20, render=False):
     for k, v in results.items():
         print(f"{k:>15}: {v}")
     print(f"Mean Reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}")
+
+    # Plot evaluation summary
+    labels = list(results.keys())
+    counts = list(results.values())
+    plt.figure(figsize=(6, 4))
+    plt.bar(labels, counts, color="skyblue")
+    plt.title("🚀 Evaluation Results (Episode Outcomes)")
+    plt.ylabel("Count")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.savefig(os.path.join(MODEL_DIR, "evaluation_summary.png"))
+    print(f"📊 Saved evaluation summary plot to {MODEL_DIR}/evaluation_summary.png")
 
 
 # ---------- Main ----------
