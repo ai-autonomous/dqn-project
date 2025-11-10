@@ -10,6 +10,7 @@ on:
         options:
           - dqn
           - ddqn
+          - rdqn
         default: "dqn"
 
       environment:
@@ -79,13 +80,7 @@ jobs:
           echo "📦 Stage Size: $STAGE_SIZE"
           echo "💡 Learning Rate: $LEARNING_RATE"
 
-          if [ "$ENV_NAME" = "cartpole" ]; then
-            ENV_VERSION="v1"
-          else
-            ENV_VERSION="v3"
-          fi
-
-          FILE="train_${ALGO}_${ENV_NAME}_${ENV_VERSION}.py"
+          FILE="train_${ALGO}_${ENV_NAME}.py"
           echo "📄 Running script: $FILE"
 
           if [ ! -f "$FILE" ]; then
@@ -109,4 +104,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rl-trained-model
-          path: models_v3/
+          path: models/
