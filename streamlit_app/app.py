@@ -132,17 +132,14 @@ for run in runs:
 
 # ---------------- DATAFRAME ----------------
 df = pd.DataFrame(rows)
-st.success(f"Showing {len(df)} job runs on page {page}")
 
 # ---------------- FILTER BAR ----------------
 st.subheader("🔍 Filters")
 
-colA, colB, colC = st.columns(3)
+colA, colB = st.columns(2)
 with colA:
-    algo_filter = st.selectbox("Filter by Algorithm", ["All"] + sorted(df["algorithm"].unique()))
+    algo_filter = st.selectbox("Filter by Algorithm", ["All", "dqn", "ddqn", "rdqn"])
 with colB:
-    env_filter = st.selectbox("Filter by Environment", ["All"] + sorted(df["environment"].unique()))
-with colC:
     result_filter = st.selectbox("Filter by Result", ["All"] + sorted(df["Result"].unique()))
 
 # Apply filters
@@ -150,9 +147,6 @@ filtered_df = df.copy()
 
 if algo_filter != "All":
     filtered_df = filtered_df[filtered_df["algorithm"] == algo_filter]
-
-if env_filter != "All":
-    filtered_df = filtered_df[filtered_df["environment"] == env_filter]
 
 if result_filter != "All":
     filtered_df = filtered_df[filtered_df["Result"] == result_filter]
