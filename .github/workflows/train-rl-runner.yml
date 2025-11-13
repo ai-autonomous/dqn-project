@@ -64,6 +64,13 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
 
+      - name: Print Workflow Inputs
+        run: |
+          echo "=== WORKFLOW INPUTS START ==="
+          echo "algorithm: ${{ github.event.inputs.algorithm }}"
+          echo "environment: ${{ github.event.inputs.environment }}"
+          echo "=== WORKFLOW INPUTS END ==="
+
       # Step 5 — Build training filename and execute
       - name: Run RL Training
         env:
