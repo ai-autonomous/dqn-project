@@ -1,127 +1,178 @@
-import gymnasium as gym
-import torch
-import torch.nn as nn
-import torch.optim as optim
+"""
+Basic DDQN training script for CartPole-v1 using Stable-Baselines3 (SB3).
+This version is compatible with older/limited SB3 installations.
+"""
+
+import os
+import argparse
 import numpy as np
-import random
-from collections import deque
+import gymnasium as gym
+from stable_baselines3 import DQN # Using the basic DQN class
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.evaluation import evaluate_policy
+import torch
+import matplotlib.pyplot as plt
+import warnings
 
-class DuelingDQN(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        super(DuelingDQN, self).__init__()
-        self.feature = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.ReLU()
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
+
+# ---------- Parse CLI Arguments ----------
+parser = argparse.ArgumentParser(description="Train DQN on CartPole-v1 with configurable params.")
+parser.add_argument("--total_steps", type=int, default=1_000_000, help="Total training timesteps")
+parser.add_argument("--stage_size", type=int, default=100_000, help="Steps per training stage")
+parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate for DQN")
+args = parser.parse_args()
+
+# ---------- Environment ----------
+ENV_NAME = "CartPole-v1"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu" 
+
+# ---------- Paths ----------
+MODEL_DIR = "models"
+MODEL_PATH = os.path.join(MODEL_DIR, "dqn_cartpole_v1.zip")
+TB_LOG = "./tb_dqn_cartpole_v1"
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+print(f"Starting DQN training on {ENV_NAME}")
+print(f"Device: {DEVICE}")
+print(f"Total steps: {args.total_steps}, Stage size: {args.stage_size}, LR: {args.lr}")
+
+# ---------- Helper: detect termination reason (CartPole) ----------
+def termination_reason(terminated, truncated, steps):
+    if truncated:
+        return "TIME_LIMIT"
+    elif terminated and steps >= 195:
+        return "GOOD_RUN"
+    elif terminated:
+        return "FAIL"
+    else:
+        return "UNKNOWN"
+
+# ---------- Environment factory ----------
+def make_env(seed=0):
+    env = gym.make(ENV_NAME)
+    env = Monitor(env)
+    env.reset(seed=seed)
+    return env
+
+# ---------- Training ----------
+def train_dqn(total_steps, stage_size, lr):
+    env = make_env(0)
+    eval_env = make_env(100)
+    # Reverting to the original policy_kwargs that worked previously:
+    policy_kwargs = dict(net_arch=[128, 128])
+
+    # Load or initialize model
+    if os.path.exists(MODEL_PATH):
+        print(f"Loading existing model from {MODEL_PATH}")
+        model = DQN.load(MODEL_PATH, env=env)
+    else:
+        print(f"Creating new DQN model for {ENV_NAME}")
+        model = DQN(
+            "MlpPolicy",
+            env,
+            learning_rate=lr,
+            buffer_size=50_000,
+            batch_size=32,
+            tau=1.0,
+            gamma=0.99,
+            train_freq=4,
+            gradient_steps=1,
+            target_update_interval=250,
+            exploration_fraction=0.1,
+            exploration_final_eps=0.01,
+            verbose=1,
+            seed=0,
+            tensorboard_log=TB_LOG,
+            policy_kwargs=policy_kwargs,
+            device=DEVICE,
+            # No advanced flags here because your library version doesn't support them
         )
-        self.value_stream = nn.Sequential(
-            nn.Linear(128, 1)
-        )
-        self.advantage_stream = nn.Sequential(
-            nn.Linear(128, action_dim)
-        )
 
-    def forward(self, x):
-        x = self.feature(x)
-        value = self.value_stream(x)
-        advantage = self.advantage_stream(x)
-        return value + advantage - advantage.mean()
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=MODEL_DIR,
+        log_path=MODEL_DIR,
+        eval_freq=10_000,
+        deterministic=True,
+        render=False,
+        verbose=0,
+    )
 
-class PrioritizedReplayBuffer:
-    def __init__(self, capacity, alpha=0.6):
-        self.capacity = capacity
-        self.buffer = []
-        self.priorities = np.zeros((capacity,), dtype=np.float32)
-        self.pos = 0
-        self.alpha = alpha
+    stages = max(1, total_steps // stage_size)
+    reward_progress = []
 
-    def add(self, transition, error):
-        max_priority = self.priorities.max() if self.buffer else 1.0
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(transition)
-        else:
-            self.buffer[self.pos] = transition
-        self.priorities[self.pos] = max_priority
-        self.pos = (self.pos + 1) % self.capacity
+    for s in range(stages):
+        print(f"\n=== Stage {s+1}/{stages} → training {stage_size:,} steps ===")
+        model.learn(total_timesteps=stage_size, reset_num_timesteps=False, callback=eval_callback)
+        model.save(MODEL_PATH)
+        print(f"Saved checkpoint after {stage_size*(s+1):,} total steps")
 
-    def sample(self, batch_size, beta=0.4):
-        if len(self.buffer) == self.capacity:
-            priorities = self.priorities
-        else:
-            priorities = self.priorities[:self.pos]
-        probs = priorities ** self.alpha
-        probs /= probs.sum()
-        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
-        samples = [self.buffer[i] for i in indices]
-        total = len(self.buffer)
-        weights = (total * probs[indices]) ** (-beta)
-        weights /= weights.max()
-        return samples, indices, torch.FloatTensor(weights)
+        mean_r, std_r = evaluate_policy(model, eval_env, n_eval_episodes=10)
+        reward_progress.append(mean_r)
+        print(f"Evaluation after {stage_size*(s+1):,} steps: mean={mean_r:.2f} ± {std_r:.2f}")
 
-    def update_priorities(self, indices, errors):
-        for i, error in zip(indices, errors):
-            self.priorities[i] = error + 1e-5
+    # Plot training reward trend
+    plt.figure(figsize=(8, 4))
+    plt.plot(np.arange(1, stages + 1), reward_progress, marker="o")
+    plt.title("DQN Training Progress on CartPole-v1")
+    plt.xlabel("Training Stage")
+    plt.ylabel("Mean Reward")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(MODEL_DIR, "training_reward_plot_cartpole.png"))
+    print(f"Saved training progress plot to {MODEL_DIR}/training_reward_plot_cartpole.png")
 
-def train_rainbow(env, episodes=500):
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
-    policy_net = DuelingDQN(state_dim, action_dim)
-    target_net = DuelingDQN(state_dim, action_dim)
-    target_net.load_state_dict(policy_net.state_dict())
-    target_net.eval()
+    print("Training complete!")
+    env.close()
+    eval_env.close()
+    return model
 
-    optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
-    buffer = PrioritizedReplayBuffer(10000)
-    gamma = 0.99
-    batch_size = 64
-    epsilon = 1.0
-    update_target_every = 10
+# ---------- Evaluation ----------
+def evaluate_and_report(model, n_eval_episodes=20, render=False):
+    # ... (evaluation function is unchanged) ...
+    env = make_env(999)
+    results = {"TIME_LIMIT": 0, "GOOD_RUN": 0, "FAIL": 0, "UNKNOWN": 0}
+    rewards = []
 
-    for ep in range(episodes):
-        #state = env.reset()
-        state, _ = env.reset()
-        total_reward = 0
-        done = False
-        while not done:
-            if random.random() < epsilon:
-                action = env.action_space.sample()
-            else:
-                with torch.no_grad():
-                    action = torch.argmax(policy_net(torch.FloatTensor(state))).item()
-            next_state, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            #next_state, reward, done, _ = env.step(action)
-            td_error = abs(reward)
-            buffer.add((state, action, reward, next_state, done), td_error)
-            state = next_state
-            total_reward += reward
+    for ep in range(n_eval_episodes):
+        obs, info = env.reset()
+        ep_reward, steps = 0.0, 0
+        while True:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = env.step(action)
+            ep_reward += reward
+            steps += 1
+            if render:
+                env.render()
+            if terminated or truncated:
+                reason = termination_reason(terminated, truncated, steps)
+                results[reason] = results.get(reason, 0) + 1
+                rewards.append(ep_reward)
+                print(f"Ep {ep+1:02d}/{n_eval_episodes} → Reward={ep_reward:7.2f}, Steps={steps:3d}, End={reason}")
+                break
 
-            if len(buffer.buffer) >= batch_size:
-                batch, indices, weights = buffer.sample(batch_size)
-                states, actions, rewards, next_states, dones = zip(*batch)
-                states = torch.FloatTensor(states)
-                actions = torch.LongTensor(actions)
-                rewards = torch.FloatTensor(rewards)
-                next_states = torch.FloatTensor(next_states)
-                dones = torch.BoolTensor(dones)
+    env.close()
+    print("\n=== Evaluation Summary ===")
+    for k, v in results.items():
+        print(f"{k:>12}: {v}")
+    print(f"Mean Reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}")
 
-                q_values = policy_net(states).gather(1, actions.unsqueeze(1)).squeeze()
-                next_actions = torch.argmax(policy_net(next_states), dim=1)
-                next_q_values = target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze()
-                targets = rewards + gamma * next_q_values * (~dones)
+    # Plot evaluation summary
+    labels = list(results.keys())
+    counts = list(results.values())
+    plt.figure(figsize=(6, 4))
+    plt.bar(labels, counts, color="skyblue")
+    plt.title("Evaluation Results (Episode Outcomes) — CartPole-v1")
+    plt.ylabel("Count")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.savefig(os.path.join(MODEL_DIR, "evaluation_summary_cartpole.png"))
+    print(f"Saved evaluation summary plot to {MODEL_DIR}/evaluation_summary_cartpole.png")
 
-                loss = (q_values - targets.detach()).pow(2) * weights
-                buffer.update_priorities(indices, loss.detach().numpy())
-                loss = loss.mean()
+# ---------- Main ----------
+if __name__ == "__main__":
+    model = train_dqn(args.total_steps, args.stage_size, args.lr)
+    evaluate_and_report(model, n_eval_episodes=20, render=False)
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-        if ep % update_target_every == 0:
-            target_net.load_state_dict(policy_net.state_dict())
-
-        epsilon = max(0.01, epsilon * 0.995)
-        print(f"Episode {ep}, Reward: {total_reward}")
-
-env = gym.make("CartPole-v1")
-train_rainbow(env)
