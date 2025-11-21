@@ -113,6 +113,7 @@ def train_dqn(total_steps, stage_size, lr):
             tau=1.0, gamma=0.99, train_freq=4, gradient_steps=1,
             target_update_interval=500, exploration_fraction=0.4,
             exploration_final_eps=0.05, verbose=1, seed=0,
+            double_q=False,
             tensorboard_log="./tb_dqn_lunarlander_v3",
             device=DEVICE, policy_kwargs=dict(net_arch=[256, 256]),
         )
