@@ -34,7 +34,7 @@ def learning_rate():  # Alpha
     return 0.001
 
 def batch_size():
-    return 32
+    return 64
 
 
 # =========================
@@ -157,8 +157,8 @@ dqn = DoubleDeepQNetwork(
 batch = batch_size()
 
 # Training params
-EPISODES = 100
-MAX_STEPS = 50            # per episode
+EPISODES = 500
+MAX_STEPS = 100            # per episode
 TARGET_SYNC_EVERY = 1       # episodes
 SOLVE_LINE = 200.0          # moving average(100) target for LunarLander
 
