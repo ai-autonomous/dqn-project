@@ -247,8 +247,8 @@ rainbow = RainbowDQN(
 
 batch = batch_size()
 
-EPISODES = 100
-MAX_STEPS = 50
+EPISODES = 500
+MAX_STEPS = 200
 TARGET_SYNC_EVERY = 5
 SOLVE_LINE = 200.0
 
