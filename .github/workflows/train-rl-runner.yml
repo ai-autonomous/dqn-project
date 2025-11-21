@@ -1,4 +1,4 @@
-name: RL Trainer (Configurable Manual Runner)
+name: Deep Q Learning Workflow
 
 on:
   workflow_dispatch:
