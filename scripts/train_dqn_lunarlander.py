@@ -39,25 +39,28 @@ REWARD_CSV = os.path.join(MODEL_DIR, "reward_log.csv")
 
 # ---------- LOSS LOGGER ----------
 class LossLogger(BaseCallback):
-    """Collect loss values during training"""
+    """Collect DQN loss values from SB3 logger."""
 
     def __init__(self, verbose=0):
         super().__init__(verbose)
         self.losses = []
 
     def _on_step(self) -> bool:
-        if "loss" in self.locals:
-            self.losses.append(self.locals["loss"])
+        # Grab loss if available in logger
+        loss = self.model.logger.name_to_value.get("train/loss")
+        if loss is not None:
+            self.losses.append(loss)
         return True
 
     def save(self):
         if not self.losses:
+            print("⚠️ No loss values tracked. SB3 may not expose per-step loss.")
             return
-        # Save CSV
+
         pd.DataFrame({"loss": self.losses}).to_csv(LOSS_CSV, index=False)
-        # Save Plot
+
         plt.figure(figsize=(8, 4))
-        plt.plot(self.losses, alpha=0.7)
+        plt.plot(self.losses, alpha=0.7, color="red")
         plt.title("📉 DQN Loss During Training")
         plt.xlabel("Training Steps")
         plt.ylabel("Loss")
@@ -65,6 +68,7 @@ class LossLogger(BaseCallback):
         plt.tight_layout()
         plt.savefig(os.path.join(MODEL_DIR, "loss_plot.png"))
         print("💾 Saved loss logs & plot!")
+
 
 
 # ---------- TERMINATION REASON ----------
