@@ -1,5 +1,6 @@
 """
-DQN training with loss & reward tracking + evaluation outcome plots
+DQN training with loss & reward tracking + evaluation summary plots
+DO NOT REMOVE: Evaluation summary print section
 """
 
 import os
@@ -35,8 +36,11 @@ MODEL_PATH = os.path.join(MODEL_DIR, "dqn_lunarlander_v3.zip")
 LOSS_CSV = os.path.join(MODEL_DIR, "loss_log.csv")
 REWARD_CSV = os.path.join(MODEL_DIR, "reward_log.csv")
 
-# ---------- Custom Callback: Track Loss ----------
+
+# ---------- LOSS LOGGER ----------
 class LossLogger(BaseCallback):
+    """Collect loss values during training"""
+
     def __init__(self, verbose=0):
         super().__init__(verbose)
         self.losses = []
@@ -47,20 +51,25 @@ class LossLogger(BaseCallback):
         return True
 
     def save(self):
-        if self.losses:
-            pd.DataFrame({"loss": self.losses}).to_csv(LOSS_CSV, index=False)
-            plt.figure(figsize=(8, 4))
-            plt.plot(self.losses, alpha=0.7)
-            plt.title("📉 DQN Loss During Training")
-            plt.xlabel("Training Steps")
-            plt.ylabel("Loss")
-            plt.grid()
-            plt.tight_layout()
-            plt.savefig(os.path.join(MODEL_DIR, "loss_plot.png"))
-            print("💾 Saved loss logs & plot!")
+        if not self.losses:
+            return
+        # Save CSV
+        pd.DataFrame({"loss": self.losses}).to_csv(LOSS_CSV, index=False)
+        # Save Plot
+        plt.figure(figsize=(8, 4))
+        plt.plot(self.losses, alpha=0.7)
+        plt.title("📉 DQN Loss During Training")
+        plt.xlabel("Training Steps")
+        plt.ylabel("Loss")
+        plt.grid()
+        plt.tight_layout()
+        plt.savefig(os.path.join(MODEL_DIR, "loss_plot.png"))
+        print("💾 Saved loss logs & plot!")
 
-# ---------- Termination Reason Helper ----------
+
+# ---------- TERMINATION REASON ----------
 def termination_reason(env, obs):
+    """Detect landing outcome in LunarLander-v3"""
     um = env.unwrapped
     try:
         x_pos = float(obs[0])
@@ -76,14 +85,16 @@ def termination_reason(env, obs):
     except:
         return "DONE"
 
-# ---------- Environment ----------
+
+# ---------- ENV FACTORY ----------
 def make_env(seed=0):
     env = gym.make(ENV_NAME)
     env = Monitor(env)
     env.reset(seed=seed)
     return env
 
-# ---------- Training ----------
+
+# ---------- TRAINING ----------
 def train_dqn(total_steps, stage_size, lr):
     env, eval_env = make_env(0), make_env(100)
 
@@ -103,9 +114,11 @@ def train_dqn(total_steps, stage_size, lr):
         )
 
     loss_logger = LossLogger()
-    eval_callback = EvalCallback(eval_env, best_model_save_path=MODEL_DIR,
-                                 log_path=MODEL_DIR, eval_freq=20_000,
-                                 deterministic=True, verbose=0)
+    eval_callback = EvalCallback(
+        eval_env, best_model_save_path=MODEL_DIR,
+        log_path=MODEL_DIR, eval_freq=20_000,
+        deterministic=True, verbose=0
+    )
 
     reward_progress = []
     stages = total_steps // stage_size
@@ -123,7 +136,7 @@ def train_dqn(total_steps, stage_size, lr):
     # Save loss plots
     loss_logger.save()
 
-    # Save training reward trend
+    # Save Reward CSV + Plot
     pd.DataFrame({"reward": reward_progress}).to_csv(REWARD_CSV, index=False)
     plt.figure(figsize=(8, 4))
     plt.plot(np.arange(1, stages + 1), reward_progress, marker="o")
@@ -138,11 +151,13 @@ def train_dqn(total_steps, stage_size, lr):
     env.close(); eval_env.close()
     return model
 
-# ---------- Evaluation & Bar Graph ----------
+
+# ---------- EVALUATION (PRINT + PLOT) ----------
 def evaluate_and_report(model, n_eps=20):
     env = make_env(999)
-    outcomes = {"LANDED_OK": 0, "CRASH": 0, "OUT_OF_BOUNDS": 0,
-                "ASLEEP": 0, "UNKNOWN": 0, "DONE": 0}
+    outcomes = {"LANDED_OK": 0, "CRASH": 0,
+                "OUT_OF_BOUNDS": 0, "ASLEEP": 0,
+                "UNKNOWN": 0, "DONE": 0}
     rewards = []
 
     for ep in range(n_eps):
@@ -160,7 +175,13 @@ def evaluate_and_report(model, n_eps=20):
 
     env.close()
 
-    # Bar plot
+    # 📌 DO NOT REMOVE: PRINT SUMMARY
+    print("\n=== Evaluation Summary ===")
+    for k, v in outcomes.items():
+        print(f"{k:>15}: {v}")
+    print(f"Mean Reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}")
+
+    # Bar Plot
     labels, counts = list(outcomes.keys()), list(outcomes.values())
     plt.figure(figsize=(6, 4))
     plt.bar(labels, counts, color="lightgreen")
@@ -171,7 +192,8 @@ def evaluate_and_report(model, n_eps=20):
     plt.savefig(os.path.join(MODEL_DIR, "evaluation_summary.png"))
     print("💾 Saved evaluation outcome bar graph!")
 
-# ---------- Main ----------
+
+# ---------- MAIN ----------
 if __name__ == "__main__":
     print(f"🚀 Training on {ENV_NAME} | Steps={args.total_steps:,} | LR={args.lr}")
     model = train_dqn(args.total_steps, args.stage_size, args.lr)
