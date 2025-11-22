@@ -32,10 +32,10 @@ def discount_rate():  # Gamma
     return 1
 
 def learning_rate():  # Alpha
-    return 0.005
+    return 0.0005
 
 def batch_size():
-    return 64
+    return 128
 
 
 # =========================
@@ -247,8 +247,8 @@ rainbow = RainbowDQN(
 
 batch = batch_size()
 
-EPISODES = 500
-MAX_STEPS = 200
+EPISODES = 2000000
+MAX_STEPS = 200000
 TARGET_SYNC_EVERY = 5
 SOLVE_LINE = 200.0
 
@@ -297,26 +297,68 @@ else:
 
 
 # =========================
-# Testing (no learning)
+# Testing (with detailed metrics)
 # =========================
-TEST_EPISODES = 10
+TEST_EPISODES = 20
+
+metrics = {
+    "LANDED_OK": 0,
+    "CRASHED": 0,
+    "OUT_OF_BOUNDS": 0,
+    "ASLEEP": 0,
+    "UNKNOWN": 0,
+    "DONE": 0
+}
+
 test_rewards = []
+
 for te in range(TEST_EPISODES):
     s, _ = envLunar.reset(seed=SEED + 1000 + te)
     ep_r = 0.0
     done = False
+
     while not done:
         q_vals = rainbow.model.predict(s.reshape(1, -1), verbose=0)
         a = int(np.argmax(q_vals[0]))
-        s, r, terminated, truncated, _ = envLunar.step(a)
+        s, r, terminated, truncated, info = envLunar.step(a)
         done = terminated or truncated
         ep_r += r
+
+    # Extract landing reason (only in v3)
+    reason = info.get("termination_reason", "").upper()
+
+    if "LAND" in reason:
+        metrics["LANDED_OK"] += 1
+    elif "CRASH" in reason:
+        metrics["CRASHED"] += 1
+    elif "OUT_OF_BOUNDS" in reason or "OUT" in reason:
+        metrics["OUT_OF_BOUNDS"] += 1
+    elif "ASLEEP" in reason:
+        metrics["ASLEEP"] += 1
+    elif "DONE" in reason:
+        metrics["DONE"] += 1
+    else:
+        metrics["UNKNOWN"] += 1
+
     test_rewards.append(ep_r)
 
+
+# =========================
+# Summary of test results
+# =========================
 print("==== TEST SUMMARY ====")
-print(f"episodes={TEST_EPISODES}")
-print(f"mean_reward={np.mean(test_rewards):.2f}  std={np.std(test_rewards):.2f}")
-print(f"min_reward={np.min(test_rewards):.2f}  max_reward={np.max(test_rewards):.2f}")
+print(f"Test Episodes: {TEST_EPISODES}")
+print("----------------------------------")
+
+for k, v in metrics.items():
+    print(f"{k}: {v}")
+
+print("----------------------------------")
+print(f"Mean Reward: {np.mean(test_rewards):.2f}")
+print(f"Std Reward : {np.std(test_rewards):.2f}")
+print(f"Min Reward : {np.min(test_rewards):.2f}")
+print(f"Max Reward : {np.max(test_rewards):.2f}")
+
 
 
 # =========================
