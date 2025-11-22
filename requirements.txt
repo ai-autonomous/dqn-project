@@ -32,6 +32,7 @@ swig==4.4.0
 sympy==1.14.0
 tensorboard==2.20.0
 tensorboard-data-server==0.7.2
+tensorflow
 torch==2.9.0
 typing_extensions==4.15.0
 tzdata==2025.2

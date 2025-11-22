@@ -1,7 +1,3 @@
-# =========================
-# Imports & Setup
-# =========================
-
 import random
 from collections import deque
 
