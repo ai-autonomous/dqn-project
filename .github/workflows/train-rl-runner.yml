@@ -22,6 +22,15 @@ on:
           - cartpole
           - recsim
         default: "lunarlander"
+      
+      approach:
+        description: "Choose the approach"
+        required: true
+        type: choice
+        options:
+          - stable_baseline
+          - keras
+        default: "stable_baseline"
 
       total_steps:
         description: "Total training timesteps"
@@ -76,6 +85,7 @@ jobs:
         env:
           ALGO: ${{ github.event.inputs.algorithm }}
           ENV_NAME: ${{ github.event.inputs.environment }}
+          APPROACH: ${{ github.event.inputs.approach }}
           TOTAL_STEPS: ${{ github.event.inputs.total_steps }}
           STAGE_SIZE: ${{ github.event.inputs.stage_size }}
           LEARNING_RATE: ${{ github.event.inputs.learning_rate }}
@@ -83,11 +93,12 @@ jobs:
           echo "🚀 Starting RL Training"
           echo "🧠 Algorithm: $ALGO"
           echo "🌍 Environment: $ENV_NAME"
+          echo "🌍 Approach: $APPROACH"
           echo "🔢 Total Steps: $TOTAL_STEPS"
           echo "📦 Stage Size: $STAGE_SIZE"
           echo "💡 Learning Rate: $LEARNING_RATE"
 
-          FILE="scripts/train_${ALGO}_${ENV_NAME}.py"
+          FILE="scripts/train_${ALGO}_${ENV_NAME}_{APPROACH}.py"
           echo "📄 Running script: $FILE"
 
           if [ ! -f "$FILE" ]; then
