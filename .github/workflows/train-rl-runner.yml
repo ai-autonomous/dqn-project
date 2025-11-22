@@ -98,7 +98,7 @@ jobs:
           echo "📦 Stage Size: $STAGE_SIZE"
           echo "💡 Learning Rate: $LEARNING_RATE"
 
-          FILE="scripts/train_${ALGO}_${ENV_NAME}_{APPROACH}.py"
+          FILE="scripts/train_${ALGO}_${ENV_NAME}_${APPROACH}.py"
           echo "📄 Running script: $FILE"
 
           if [ ! -f "$FILE" ]; then
