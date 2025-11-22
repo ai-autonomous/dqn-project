@@ -1,33 +1,43 @@
 import random
 from collections import deque
+import os
+import argparse
 
 import gymnasium as gym
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 
 import tensorflow as tf
 from tensorflow import keras
-import Box2D
+import Box2D  # DO NOT REMOVE
 
+# =========================
+# Device Selection (CPU/GPU/Metal Auto)
+# =========================
+gpus = tf.config.list_physical_devices('GPU')
+if len(gpus) > 0:
+    DEVICE = "/GPU:0"   # NVIDIA CUDA or Apple Metal (tensorflow-metal)
+else:
+    DEVICE = "/CPU:0"
+print(f"🔧 Using TensorFlow device: {DEVICE}")
 
+# =========================
 # Reproducibility
+# =========================
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 # =========================
-# Hyperparameter helpers
+# Hyperparameter Helpers
 # =========================
 def discount_rate():  # Gamma
     return 1
 
-def learning_rate():  # Alpha
-    return 0.0005
-
 def batch_size():
     return 128
-
 
 # =========================
 # Environment
@@ -36,7 +46,6 @@ envLunar = gym.make('LunarLander-v3')
 envLunar.reset(seed=SEED)
 envLunar.action_space.seed(SEED)
 envLunar.observation_space.seed(SEED)
-
 
 # =========================
 # Prioritized Replay Buffer
@@ -59,11 +68,7 @@ class PrioritizedReplayBuffer:
         self.pos = (self.pos + 1) % self.capacity
 
     def sample(self, batch_size, beta=0.4):
-        if len(self.buffer) == self.capacity:
-            prios = self.priorities
-        else:
-            prios = self.priorities[:self.pos]
-
+        prios = self.priorities if len(self.buffer) == self.capacity else self.priorities[:self.pos]
         probs = prios ** self.alpha
         probs /= probs.sum()
 
@@ -73,7 +78,7 @@ class PrioritizedReplayBuffer:
         total = len(self.buffer)
         weights = (total * probs[indices]) ** (-beta)
         weights /= weights.max()
-        weights = np.array(weights, dtype=np.float32)
+        weights = weights.astype(np.float32)
 
         states, actions, rewards, next_states, dones = zip(*samples)
         return (
@@ -93,9 +98,8 @@ class PrioritizedReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
-
 # =========================
-# Rainbow-style DQN Agent
+# Rainbow-Style DQN Agent
 # =========================
 class RainbowDQN:
     def __init__(self, states, actions, alpha, gamma,
@@ -121,9 +125,10 @@ class RainbowDQN:
         self.n_gamma = gamma ** n_step
         self.n_step_buffer = deque(maxlen=n_step)
 
-        self.model = self.build_model()
-        self.model_target = self.build_model()
-        self.update_target_from_model()
+        with tf.device(DEVICE):
+            self.model = self.build_model()
+            self.model_target = self.build_model()
+            self.update_target_from_model()
 
         self.loss = []
 
@@ -132,50 +137,43 @@ class RainbowDQN:
         x = keras.layers.Dense(128, activation='relu')(inputs)
         x = keras.layers.Dense(128, activation='relu')(x)
 
-        V = keras.layers.Dense(1, activation=None)(x)
-        A = keras.layers.Dense(self.nA, activation=None)(x)
+        V = keras.layers.Dense(1)(x)
+        A = keras.layers.Dense(self.nA)(x)
 
-        #A_mean = keras.layers.Lambda(lambda a: tf.reduce_mean(a, axis=1, keepdims=True))(A)
-        A_mean = keras.layers.Lambda(
-                    lambda a: tf.reduce_mean(a, axis=1, keepdims=True),
-                    output_shape=(1,))(A)
+        A_mean = keras.layers.Lambda(lambda a: tf.reduce_mean(a, axis=1, keepdims=True))(A)
         Q = keras.layers.Add()([V, keras.layers.Subtract()([A, A_mean])])
 
         model = keras.Model(inputs=inputs, outputs=Q)
-        model.compile(
-            loss='mean_squared_error',
-            optimizer=keras.optimizers.Adam(learning_rate=self.alpha)
-        )
+        model.compile(loss='mean_squared_error', optimizer=keras.optimizers.Adam(learning_rate=self.alpha))
         return model
 
     def update_target_from_model(self):
         self.model_target.set_weights(self.model.get_weights())
 
     def _get_beta(self):
-        return min(1.0, self.per_beta_start + (1.0 - self.per_beta_start) * (self.frame_idx / float(self.per_beta_frames)))
+        return min(1.0, self.per_beta_start +
+                   (1.0 - self.per_beta_start) * (self.frame_idx / float(self.per_beta_frames)))
 
     def action(self, state):
         if np.random.rand() <= self.epsilon:
             return random.randrange(self.nA)
-        q_vals = self.model.predict(state.reshape(1, -1), verbose=0)
+        with tf.device(DEVICE):
+            q_vals = self.model.predict(state.reshape(1, -1), verbose=0)
         return int(np.argmax(q_vals[0]))
 
     def _store_n_step(self, transition):
         self.n_step_buffer.append(transition)
         if len(self.n_step_buffer) < self.n_step:
             return None
-        R = 0.0
-        for idx, (_, _, r, _, _) in enumerate(self.n_step_buffer):
-            R += (self.gamma ** idx) * r
-        state, action, _, _, _ = self.n_step_buffer[0]
-        _, _, _, next_state, done = self.n_step_buffer[-1]
-        return (state, action, R, next_state, done)
+        R = sum((self.gamma ** i) * t[2] for i, t in enumerate(self.n_step_buffer))
+        s, a, _, _, _ = self.n_step_buffer[0]
+        _, _, _, ns, d = self.n_step_buffer[-1]
+        return (s, a, R, ns, d)
 
     def remember(self, state, action, reward, nstate, done):
-        n_step_transition = self._store_n_step((state, action, reward, nstate, done))
-        if n_step_transition:
-            s, a, R, ns, d = n_step_transition
-            self.memory.push(s, a, R, ns, d)
+        n = self._store_n_step((state, action, reward, nstate, done))
+        if n:
+            self.memory.push(*n)
 
     def experience_replay(self, batch_size):
         if len(self.memory) < batch_size:
@@ -184,11 +182,12 @@ class RainbowDQN:
         beta = self._get_beta()
         self.frame_idx += 1
 
-        states, actions, rewards, next_states, dones, indices, weights = self.memory.sample(batch_size, beta=beta)
+        states, actions, rewards, next_states, dones, indices, weights = self.memory.sample(batch_size, beta)
 
-        q_st = self.model.predict(states, verbose=0)
-        q_next_online = self.model.predict(next_states, verbose=0)
-        q_next_target = self.model_target.predict(next_states, verbose=0)
+        with tf.device(DEVICE):
+            q_st = self.model.predict(states, verbose=0)
+            q_next_online = self.model.predict(next_states, verbose=0)
+            q_next_target = self.model_target.predict(next_states, verbose=0)
 
         td_errors = np.zeros(batch_size, dtype=np.float32)
         for i in range(batch_size):
@@ -205,47 +204,46 @@ class RainbowDQN:
             target[a] = y
             q_st[i] = target
 
-        weights = weights.reshape(-1, 1)
-        hist = self.model.fit(states, q_st, epochs=1, verbose=0, batch_size=batch_size, sample_weight=weights.squeeze())
-        self.loss.append(hist.history['loss'][0])
+        weights = weights.squeeze()
 
-        new_priorities = np.abs(td_errors) + 1e-6
-        self.memory.update_priorities(indices, new_priorities)
+        with tf.device(DEVICE):
+            hist = self.model.fit(states, q_st, epochs=1, verbose=0,
+                                  batch_size=batch_size, sample_weight=weights)
+
+        self.loss.append(hist.history['loss'][0])
+        self.memory.update_priorities(indices, np.abs(td_errors) + 1e-6)
 
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
 
+# =========================
+# Create and Train Rainbow Agent
+# =========================
 
-# =========================
-# Create Rainbow Agent & Train
-# =========================
+MODEL_DIR = "keras_rainbow_ddqn_models"
+os.makedirs(MODEL_DIR, exist_ok=True)
+MODEL_PATH = os.path.join(MODEL_DIR, "rainbow_lunarlander_v3.h5")
+
+parser = argparse.ArgumentParser(description="Train Rainbow DQN on LunarLander-v3")
+parser.add_argument("--total_steps", type=int, default=500)
+parser.add_argument("--stage_size", type=int, default=500)
+parser.add_argument("--lr", type=float, default=5e-4)
+args = parser.parse_args()
+
+EPISODES = args.total_steps
+MAX_STEPS = args.stage_size
+LR = args.lr
+TARGET_SYNC_EVERY = 1
+SOLVE_LINE = 200.0
+
 nS = envLunar.observation_space.shape[0]
 nA = envLunar.action_space.n
 
-rainbow = RainbowDQN(
-    nS, nA,
-    learning_rate(),
-    discount_rate(),
-    epsilon=1.0,
-    epsilon_min=0.05,
-    epsilon_decay=0.995,
-    buffer_size=50000,
-    n_step=3,
-    per_alpha=0.6,
-    per_beta_start=0.4,
-    per_beta_frames=100000
-)
+rainbow = RainbowDQN(nS, nA, LR, discount_rate(),
+                     epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.995)
 
 batch = batch_size()
-
-EPISODES = 2000000
-MAX_STEPS = 200000
-TARGET_SYNC_EVERY = 5
-SOLVE_LINE = 200.0
-
-rewards = []
-epsilons = []
-losses = []
+rewards, epsilons, losses = [], [], []
 
 for e in range(EPISODES):
     state, _ = envLunar.reset(seed=SEED + e)
@@ -253,125 +251,82 @@ for e in range(EPISODES):
 
     for t in range(MAX_STEPS):
         action = rainbow.action(state)
-        nstate, reward, terminated, truncated, _ = envLunar.step(action)
+        nstate, r, terminated, truncated, _ = envLunar.step(action)
         done = terminated or truncated
 
-        rainbow.remember(state, action, reward, nstate, done)
-        if len(rainbow.memory) > batch:
-            rainbow.experience_replay(batch)
+        rainbow.remember(state, action, r, nstate, done)
+        rainbow.experience_replay(batch)
 
         state = nstate
-        total_reward += reward
+        total_reward += r
         if done:
             break
 
     rewards.append(total_reward)
     epsilons.append(rainbow.epsilon)
-    if len(rainbow.loss) > 0:
-        losses.append(rainbow.loss[-1])
-    else:
-        losses.append(np.nan)
+    losses.append(rainbow.loss[-1] if rainbow.loss else np.nan)
 
     if (e + 1) % TARGET_SYNC_EVERY == 0:
         rainbow.update_target_from_model()
 
-    ma100 = np.mean(rewards[-100:]) if len(rewards) >= 1 else total_reward
-    print(f"[Episode {e+1:4d}] reward={total_reward:8.2f}  MA100={ma100:8.2f}  "
-          f"epsilon={rainbow.epsilon:6.3f}  last_loss={losses[-1]:.6f}  memory={len(rainbow.memory)}")
+    print(f"[Episode {e+1}] reward={total_reward:.2f} epsilon={rainbow.epsilon:.3f} last_loss={losses[-1]:.6f}")
 
-    if len(rewards) >= 100 and np.mean(rewards[-100:]) >= SOLVE_LINE:
-        print("Environment solved based on MA100 threshold. Stopping training...")
-        TRAIN_END = e + 1
-        break
-else:
-    TRAIN_END = EPISODES
-
+# Save Model
+with tf.device(DEVICE):
+    rainbow.model.save(MODEL_PATH)
+print(f"\n💾 Saved Rainbow Model → {MODEL_PATH}")
 
 # =========================
-# Testing (with detailed metrics)
+# TEST AND METRIC SUMMARY
 # =========================
 TEST_EPISODES = 20
-
-metrics = {
-    "LANDED_OK": 0,
-    "CRASHED": 0,
-    "OUT_OF_BOUNDS": 0,
-    "ASLEEP": 0,
-    "UNKNOWN": 0,
-    "DONE": 0
-}
-
 test_rewards = []
+metrics = {k: 0 for k in ["LANDED_OK", "CRASHED", "OUT_OF_BOUNDS", "ASLEEP", "UNKNOWN", "DONE"]}
 
 for te in range(TEST_EPISODES):
     s, _ = envLunar.reset(seed=SEED + 1000 + te)
-    ep_r = 0.0
-    done = False
+    ep_r, done = 0.0, False
 
     while not done:
-        q_vals = rainbow.model.predict(s.reshape(1, -1), verbose=0)
+        with tf.device(DEVICE):
+            q_vals = rainbow.model.predict(s.reshape(1, -1), verbose=0)
         a = int(np.argmax(q_vals[0]))
         s, r, terminated, truncated, info = envLunar.step(a)
         done = terminated or truncated
         ep_r += r
 
-    # Extract landing reason (only in v3)
     reason = info.get("termination_reason", "").upper()
-
-    if "LAND" in reason:
-        metrics["LANDED_OK"] += 1
-    elif "CRASH" in reason:
-        metrics["CRASHED"] += 1
-    elif "OUT_OF_BOUNDS" in reason or "OUT" in reason:
-        metrics["OUT_OF_BOUNDS"] += 1
-    elif "ASLEEP" in reason:
-        metrics["ASLEEP"] += 1
-    elif "DONE" in reason:
-        metrics["DONE"] += 1
-    else:
-        metrics["UNKNOWN"] += 1
+    if "LAND" in reason: metrics["LANDED_OK"] += 1
+    elif "CRASH" in reason: metrics["CRASHED"] += 1
+    elif "OUT" in reason: metrics["OUT_OF_BOUNDS"] += 1
+    elif "ASLEEP" in reason: metrics["ASLEEP"] += 1
+    elif "DONE" in reason: metrics["DONE"] += 1
+    else: metrics["UNKNOWN"] += 1
 
     test_rewards.append(ep_r)
 
+print("\n==== 🧪 TEST SUMMARY ====")
+for k, v in metrics.items(): print(f"{k}: {v}")
+print(f"\nMean Reward: {np.mean(test_rewards):.2f} ± {np.std(test_rewards):.2f}")
 
 # =========================
-# Summary of test results
+# SAVE GRAPHS + CSV
 # =========================
-print("==== TEST SUMMARY ====")
-print(f"Test Episodes: {TEST_EPISODES}")
-print("----------------------------------")
+pd.DataFrame({"reward": rewards, "epsilon": epsilons, "loss": losses}).to_csv(
+    os.path.join(MODEL_DIR, "training_data.csv"), index=False)
 
-for k, v in metrics.items():
-    print(f"{k}: {v}")
+plt.figure(figsize=(12,5))
+plt.plot(rewards); plt.title("Episode Rewards"); plt.grid()
+plt.savefig(os.path.join(MODEL_DIR, "reward_plot.png"))
 
-print("----------------------------------")
-print(f"Mean Reward: {np.mean(test_rewards):.2f}")
-print(f"Std Reward : {np.std(test_rewards):.2f}")
-print(f"Min Reward : {np.min(test_rewards):.2f}")
-print(f"Max Reward : {np.max(test_rewards):.2f}")
+plt.figure(figsize=(12,4))
+plt.plot(epsilons); plt.title("Epsilon Decay"); plt.grid()
+plt.savefig(os.path.join(MODEL_DIR, "epsilon_plot.png"))
 
+if not np.all(np.isnan(losses)):
+    plt.figure(figsize=(12,4))
+    plt.plot(losses); plt.title("Loss per Episode"); plt.grid()
+    plt.savefig(os.path.join(MODEL_DIR, "loss_plot.png"))
 
-
-# =========================
-# Visualization
-# =========================
-rolling_average = np.convolve(rewards, np.ones(100)/100, mode='valid') if len(rewards) >= 100 else np.array([])
-
-plt.figure(figsize=(14,7))
-plt.plot(rewards, label='Episode Reward')
-if rolling_average.size > 0:
-    plt.plot(range(99, 99+len(rolling_average)), rolling_average, label='Moving Avg (100)', linewidth=2)
-plt.axhline(y=200.0, color='r', linestyle='--', label='Solve Threshold (200)')
-plt.xlabel('Episode'); plt.ylabel('Reward'); plt.title('Rainbow-style DQN on LunarLander-v3: Rewards')
-plt.legend(); plt.grid(True); plt.show()
-
-plt.figure(figsize=(14,4))
-plt.plot([200*x for x in epsilons], label='Epsilon (scaled x200)')
-plt.xlabel('Episode'); plt.ylabel('Scaled Value'); plt.title('Exploration (epsilon) over Episodes')
-plt.legend(); plt.grid(True); plt.show()
-
-if len(losses) > 0 and not np.all(np.isnan(losses)):
-    plt.figure(figsize=(14,4))
-    plt.plot(losses, label='Loss per Episode')
-    plt.xlabel('Episode'); plt.ylabel('Loss'); plt.title('Training Loss (Rainbow-style DQN)')
-    plt.legend(); plt.grid(True); plt.show()
+print("\n📊 Saved all graphs & training CSV!")
+print("\n🎉 RAINBOW TRAINING + TEST COMPLETE!\n")
