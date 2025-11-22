@@ -1,12 +1,3 @@
-# =========================
-# Imports & Setup
-# =========================
-
-!apt-get install -y swig
-!pip install "gymnasium[box2d]" pygame
-!pip install gymnasium
-!pip install tensorflow
-
 import random
 from collections import deque
 
