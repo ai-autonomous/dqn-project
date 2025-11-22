@@ -39,35 +39,44 @@ REWARD_CSV = os.path.join(MODEL_DIR, "reward_log.csv")
 
 # ---------- LOSS LOGGER ----------
 class LossLogger(BaseCallback):
-    """Collect DQN loss values from SB3 logger."""
+    """Collect average DQN loss per episode."""
 
     def __init__(self, verbose=0):
         super().__init__(verbose)
-        self.losses = []
+        self.episode_losses = []
+        self.current_losses = []
 
     def _on_step(self) -> bool:
-        # Grab loss if available in logger
         loss = self.model.logger.name_to_value.get("train/loss")
         if loss is not None:
-            self.losses.append(loss)
+            self.current_losses.append(loss)
+
+        # Detect new episode (Monitor wrapper logs episode end in info)
+        info = self.locals.get("infos", [{}])[0]
+        if "episode" in info:  # episode ended
+            if self.current_losses:
+                avg_loss = np.mean(self.current_losses)
+                self.episode_losses.append(avg_loss)
+            self.current_losses = []  # reset for next episode
+
         return True
 
     def save(self):
-        if not self.losses:
-            print("⚠️ No loss values tracked. SB3 may not expose per-step loss.")
+        if not self.episode_losses:
+            print("⚠️ No episode loss values tracked.")
             return
 
-        pd.DataFrame({"loss": self.losses}).to_csv(LOSS_CSV, index=False)
+        pd.DataFrame({"episode_loss": self.episode_losses}).to_csv(LOSS_CSV, index=False)
 
         plt.figure(figsize=(8, 4))
-        plt.plot(self.losses, alpha=0.7, color="red")
-        plt.title("📉 DQN Loss During Training")
-        plt.xlabel("Training Steps")
-        plt.ylabel("Loss")
+        plt.plot(self.episode_losses, marker="o", alpha=0.8, color="red")
+        plt.title("📉 Average DQN Loss Per Episode")
+        plt.xlabel("Episode")
+        plt.ylabel("Avg Loss")
         plt.grid()
         plt.tight_layout()
         plt.savefig(os.path.join(MODEL_DIR, "loss_plot.png"))
-        print("💾 Saved loss logs & plot!")
+        print("💾 Saved episode loss logs & plot!")
 
 
 
@@ -113,7 +122,6 @@ def train_dqn(total_steps, stage_size, lr):
             tau=1.0, gamma=0.99, train_freq=4, gradient_steps=1,
             target_update_interval=500, exploration_fraction=0.4,
             exploration_final_eps=0.05, verbose=1, seed=0,
-            double_q=True,
             tensorboard_log="./tb_dqn_lunarlander_v3",
             device=DEVICE, policy_kwargs=dict(net_arch=[256, 256]),
         )
