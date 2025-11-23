@@ -1,7 +1,12 @@
 """
 Improved Double DQN training script for CartPole-v1 using Stable-Baselines3 (SB3).
-Supports CLI inputs for total_steps, stage_size, and learning_rate.
-Generates reward progression and evaluation summary plots.
+Now includes advanced termination reasoning similar to LunarLander:
+  - SOLVED: Pole balances full max steps
+  - GOOD_RUN: Balance exceeds strong threshold (≥195 steps)
+  - FAIL: Pole fell or went out of bounds before threshold
+  - TIME_LIMIT: Episode ended due to time truncation (not failure)
+
+Generates reward progression & evaluation summary plots.
 """
 
 import os
@@ -39,16 +44,19 @@ print(f"Starting Double DQN training on {ENV_NAME}")
 print(f"Device: {DEVICE}")
 print(f"Total steps: {args.total_steps}, Stage size: {args.stage_size}, LR: {args.lr}")
 
-# ---------- Helper: detect termination reason (CartPole) ----------
-def termination_reason(terminated, truncated, steps):
-    if truncated:
-        return "TIME_LIMIT"
+# ===================== TERMINATION REASON (ADVANCED) =====================
+def termination_reason(terminated, truncated, steps, max_steps):
+    if truncated and steps == max_steps:
+        return "SOLVED"           # Balanced entire max steps
+    elif truncated:
+        return "TIME_LIMIT"       # Episode timeout, but not solved fully
     elif terminated and steps >= 195:
-        return "GOOD_RUN"
+        return "GOOD_RUN"         # Survived long enough (classic threshold)
     elif terminated:
-        return "FAIL"
+        return "FAIL"             # Fell early
     else:
         return "UNKNOWN"
+
 
 # ---------- Environment factory ----------
 def make_env(seed=0):
@@ -61,10 +69,8 @@ def make_env(seed=0):
 def train_double_dqn(total_steps, stage_size, lr):
     env = make_env(0)
     eval_env = make_env(100)
-    # double_q argument is handled internally by SB3 by default
     policy_kwargs = dict(net_arch=[128, 128])
 
-    # Load or initialize model
     if os.path.exists(MODEL_PATH):
         print(f"Loading existing model from {MODEL_PATH}")
         model = DQN.load(MODEL_PATH, env=env)
@@ -88,7 +94,6 @@ def train_double_dqn(total_steps, stage_size, lr):
             tensorboard_log=TB_LOG,
             policy_kwargs=policy_kwargs,
             device=DEVICE,
-            # Removed explicit double_q=True, as it's the default behavior in modern SB3
         )
 
     eval_callback = EvalCallback(
@@ -114,7 +119,6 @@ def train_double_dqn(total_steps, stage_size, lr):
         reward_progress.append(mean_r)
         print(f"Evaluation after {stage_size*(s+1):,} steps: mean={mean_r:.2f} ± {std_r:.2f}")
 
-    # Plot training reward trend
     plt.figure(figsize=(8, 4))
     plt.plot(np.arange(1, stages + 1), reward_progress, marker="o")
     plt.title("Double DQN Training Progress on CartPole-v1")
@@ -125,15 +129,15 @@ def train_double_dqn(total_steps, stage_size, lr):
     plt.savefig(os.path.join(MODEL_DIR, "training_reward_plot_double_dqn_cartpole.png"))
     print(f"Saved training progress plot to {MODEL_DIR}/training_reward_plot_double_dqn_cartpole.png")
 
-    print("Training complete!")
-    env.close()
-    eval_env.close()
+    env.close(); eval_env.close()
     return model
 
 # ---------- Evaluation ----------
 def evaluate_and_report(model, n_eval_episodes=20, render=False):
     env = make_env(999)
-    results = {"TIME_LIMIT": 0, "GOOD_RUN": 0, "FAIL": 0, "UNKNOWN": 0}
+    max_steps = env.env.spec.max_episode_steps  # dynamic limit
+
+    results = {"SOLVED": 0, "GOOD_RUN": 0, "FAIL": 0, "TIME_LIMIT": 0, "UNKNOWN": 0}
     rewards = []
 
     for ep in range(n_eval_episodes):
@@ -144,27 +148,27 @@ def evaluate_and_report(model, n_eval_episodes=20, render=False):
             obs, reward, terminated, truncated, info = env.step(action)
             ep_reward += reward
             steps += 1
-            if render:
-                env.render()
+            if render: env.render()
             if terminated or truncated:
-                reason = termination_reason(terminated, truncated, steps)
-                results[reason] = results.get(reason, 0) + 1
+                reason = termination_reason(terminated, truncated, steps, max_steps)
+                results[reason] += 1
                 rewards.append(ep_reward)
                 print(f"Ep {ep+1:02d}/{n_eval_episodes} → Reward={ep_reward:7.2f}, Steps={steps:3d}, End={reason}")
                 break
 
     env.close()
+
     print("\n=== Evaluation Summary ===")
     for k, v in results.items():
         print(f"{k:>12}: {v}")
     print(f"Mean Reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}")
 
-    # Plot evaluation summary
+    # Plot summary
     labels = list(results.keys())
     counts = list(results.values())
     plt.figure(figsize=(6, 4))
     plt.bar(labels, counts, color="skyblue")
-    plt.title("Evaluation Results (Episode Outcomes) — Double DQN CartPole-v1")
+    plt.title("Evaluation Results — Double DQN CartPole-v1")
     plt.ylabel("Count")
     plt.xticks(rotation=30)
     plt.tight_layout()
