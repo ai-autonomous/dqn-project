@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import matplotlib.pyplot as plt
+import os
 
 # -------------------- Hyperparameters --------------------
 ENV_NAME = "LunarLander-v3"
@@ -17,7 +19,7 @@ GAMMA = 0.99
 N_ATOMS = 51
 V_MIN = -200.0
 V_MAX = 200.0
-N_STEPS = 3              # n-step returns
+N_STEPS = 3
 BUFFER_SIZE = 100_000
 BATCH_SIZE = 64
 LR = 1e-4
@@ -28,6 +30,10 @@ PRIORITY_ALPHA = 0.6
 PRIORITY_BETA_START = 0.4
 PRIORITY_BETA_FRAMES = 200_000
 
+# Track Metrics
+ALL_REWARDS = []
+ALL_LOSSES = []
+
 # -------------------- Utilities --------------------
 def set_seed(seed):
     random.seed(seed)
@@ -35,6 +41,24 @@ def set_seed(seed):
     torch.manual_seed(seed)
 
 set_seed(SEED)
+
+# ---------- TERMINATION REASON ----------
+def termination_reason(env, obs):
+    """Detect landing outcome in LunarLander-v3"""
+    um = env.unwrapped
+    try:
+        x_pos = float(obs[0])
+        if getattr(um, "game_over", False):
+            return "CRASH"
+        elif abs(x_pos) >= 2.5:
+            return "OUT_OF_BOUNDS"
+        elif not bool(um.lander.awake):
+            left, right = int(obs[6]), int(obs[7])
+            return "LANDED_OK" if left == 1 and right == 1 else "ASLEEP"
+        else:
+            return "UNKNOWN"
+    except:
+        return "DONE"
 
 # -------------------- Noisy Linear --------------------
 class NoisyLinear(nn.Module):
@@ -88,11 +112,9 @@ class RainbowC51(nn.Module):
         self.fc1 = nn.Linear(state_dim, 256)
         self.fc2 = nn.Linear(256, 256)
 
-        # value stream
         self.val_fc = NoisyLinear(256, 128)
         self.val_out = NoisyLinear(128, atoms)
 
-        # advantage stream
         self.adv_fc = NoisyLinear(256, 128)
         self.adv_out = NoisyLinear(128, action_dim * atoms)
 
@@ -101,21 +123,21 @@ class RainbowC51(nn.Module):
         x = F.relu(self.fc2(x))
 
         v = F.relu(self.val_fc(x))
-        v = self.val_out(v).view(-1, 1, self.atoms)  # (batch, 1, atoms)
+        v = self.val_out(v).view(-1, 1, self.atoms)
 
         a = F.relu(self.adv_fc(x))
-        a = self.adv_out(a).view(-1, self.action_dim, self.atoms)  # (batch, A, atoms)
+        a = self.adv_out(a).view(-1, self.action_dim, self.atoms)
 
-        q_atoms = v + a - a.mean(1, keepdim=True)  # (batch, A, atoms)
-        dist = F.softmax(q_atoms, dim=2)  # distribution over atoms
-        dist = dist.clamp(min=1e-6)  # numerical stability
+        q_atoms = v + a - a.mean(1, keepdim=True)
+        dist = F.softmax(q_atoms, dim=2)
+        dist = dist.clamp(min=1e-6)
         return dist
 
     def reset_noise(self):
         self.val_fc.reset_noise(); self.val_out.reset_noise()
         self.adv_fc.reset_noise(); self.adv_out.reset_noise()
 
-# -------------------- N-step + PER replay buffer (C51-friendly) --------------------
+# -------------------- PER + N-step --------------------
 class PrioritizedReplayNstep:
     def __init__(self, capacity, n_step=N_STEPS, gamma=GAMMA, alpha=PRIORITY_ALPHA):
         self.capacity = capacity
@@ -127,43 +149,28 @@ class PrioritizedReplayNstep:
         self.pos = 0
         self.priorities = np.zeros((capacity,), dtype=np.float32)
 
-        # small queue for n-step accumulation
         self.nstep_queue = deque(maxlen=n_step)
-
         self.Transition = namedtuple('Transition', ['s', 'a', 'r', 'ns', 'd'])
 
     def _get_n_step_info(self):
-        """Compute n-step cumulative reward."""
         reward, next_state, done = 0, None, None
-
         for idx, (_, _, r, ns, d) in enumerate(self.nstep_queue):
             reward += (self.gamma ** idx) * r
             next_state = ns
             done = d
-            if d:   # terminate early if done occurs within n-step window
+            if d:
                 break
-
         return reward, next_state, done
 
     def push(self, state, action, reward, next_state, done):
-        """Stores both 1-step transitions and n-step transitions."""
-        # Add to n-step queue
         self.nstep_queue.append((state, action, reward, next_state, done))
-
-        # not enough for n-step yet
         if len(self.nstep_queue) < self.n_step:
             return
-
-        # build n-step transition
         s, a, _, _, _ = self.nstep_queue[0]
         R, ns, d = self._get_n_step_info()
-
         transition = self.Transition(s, a, R, ns, d)
-
-        # PER priority
         max_prio = self.priorities.max() if self.buffer else 1.0
 
-        # store transition
         if len(self.buffer) < self.capacity:
             self.buffer.append(transition)
         else:
@@ -178,12 +185,10 @@ class PrioritizedReplayNstep:
 
         prios = self.priorities[:len(self.buffer)]
         prios = np.maximum(prios, 1e-6)
-
         probs = prios ** self.alpha
         probs /= probs.sum()
 
         indices = np.random.choice(len(self.buffer), batch_size, p=probs)
-
         samples = [self.buffer[i] for i in indices]
         batch = self.Transition(*zip(*samples))
 
@@ -204,9 +209,9 @@ class PrioritizedReplayNstep:
 
     def __len__(self):
         return len(self.buffer)
+
 # -------------------- Distributional projection (C51) --------------------
 def projection_distribution(next_dist, rewards, dones, gamma):
-    # next_dist: (batch, atoms)
     batch_size = rewards.size(0)
     proj_dist = torch.zeros((batch_size, N_ATOMS), dtype=torch.float32)
     delta_z = float(V_MAX - V_MIN) / (N_ATOMS - 1)
@@ -226,7 +231,7 @@ def projection_distribution(next_dist, rewards, dones, gamma):
                 proj_dist[i, u] += next_dist[i, j] * (b - l)
     return proj_dist
 
-# -------------------- Agent / Training loop --------------------
+# -------------------- Agent / Training Loop --------------------
 class RainbowAgent:
     def __init__(self, state_dim, action_dim, device):
         self.device = device
@@ -247,8 +252,8 @@ class RainbowAgent:
     def select_action(self, state):
         state_v = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            dist = self.online(state_v)  # (1, A, atoms)
-            q_vals = torch.sum(dist * self.z, dim=2)  # (1, A)
+            dist = self.online(state_v)
+            q_vals = torch.sum(dist * self.z, dim=2)
             action = q_vals.argmax(1).item()
         return action
 
@@ -269,21 +274,18 @@ class RainbowAgent:
         weights = weights.to(self.device)
 
         with torch.no_grad():
-            # Double DQN: choose action with online net, evaluate with target
-            next_dist = self.online(next_states)  # (B, A, atoms)
-            next_q = torch.sum(next_dist * self.z, dim=2)  # (B, A)
-            next_actions = next_q.argmax(1)  # (B,)
+            next_dist = self.online(next_states)
+            next_q = torch.sum(next_dist * self.z, dim=2)
+            next_actions = next_q.argmax(1)
             next_dist_target = self.target(next_states)
-            next_dist_target_a = next_dist_target[range(BATCH_SIZE), next_actions]  # (B, atoms)
+            next_dist_target_a = next_dist_target[range(BATCH_SIZE), next_actions]
 
-            # Project distribution
             proj_dist = projection_distribution(next_dist_target_a, rewards, dones, GAMMA ** N_STEPS)
             proj_dist = proj_dist.to(self.device)
 
-        dist = self.online(states)  # (B, A, atoms)
-        dist_a = dist[range(BATCH_SIZE), actions]  # (B, atoms)
+        dist = self.online(states)
+        dist_a = dist[range(BATCH_SIZE), actions]
 
-        # Loss: cross-entropy between proj_dist and dist_a
         loss = - (proj_dist * dist_a.log()).sum(1)
         loss = (weights * loss).mean()
 
@@ -291,23 +293,19 @@ class RainbowAgent:
         loss.backward()
         self.optimizer.step()
 
-        # update priorities
         with torch.no_grad():
-            # compute TD error as KL divergence / or L1 between distributions' expected values
             expected = torch.sum(dist_a * self.z, dim=1)
             target_expected = torch.sum(proj_dist * self.z, dim=1)
             td_errors = (expected - target_expected).abs().cpu().numpy()
         self.replay.update_priorities(idxs, td_errors + 1e-6)
 
-        # reset noisy nets
         self.online.reset_noise(); self.target.reset_noise()
         return loss.item()
 
     def update_target(self):
         self.target.load_state_dict(self.online.state_dict())
 
-# -------------------- Main training function --------------------
-
+# -------------------- Main Training --------------------
 def train(episodes=800):
     env = gym.make(ENV_NAME, disable_env_checker=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -317,11 +315,11 @@ def train(episodes=800):
     agent = RainbowAgent(state_dim, action_dim, device)
 
     frame = 0
-    losses = []
     for ep in range(episodes):
         state, _ = env.reset()
         ep_reward = 0
         done = False
+
         while not done:
             action = agent.select_action(state)
             next_state, reward, terminated, truncated, _ = env.step(action)
@@ -331,10 +329,10 @@ def train(episodes=800):
             ep_reward += reward
             frame += 1
 
-            if frame > TRAIN_START and frame % 1 == 0:
+            if frame > TRAIN_START:
                 loss = agent.train_step()
                 if loss is not None:
-                    losses.append(loss)
+                    ALL_LOSSES.append(loss)
 
             if frame % UPDATE_TARGET_EVERY == 0:
                 agent.update_target()
@@ -342,11 +340,72 @@ def train(episodes=800):
             if done_flag:
                 break
 
+        ALL_REWARDS.append(ep_reward)
         print(f"Episode {ep} Frame {frame} Reward {ep_reward}")
 
     env.close()
+
+    # ---------- Save Model ----------
+    os.makedirs("rainbow_outputs", exist_ok=True)
+    torch.save(agent.online.state_dict(), "rainbow_outputs/rainbow_c51_lunar_v3.pth")
+
+    # ---------- Save Graphs ----------
+    plt.figure(figsize=(8, 4))
+    plt.plot(ALL_REWARDS, marker="o", alpha=0.7, color="blue")
+    plt.title("📈 Reward Per Episode - Rainbow")
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.grid()
+    plt.tight_layout()
+    plt.savefig("rainbow_outputs/reward_plot.png")
+
+    if ALL_LOSSES:
+        plt.figure(figsize=(8, 4))
+        plt.plot(ALL_LOSSES, marker="o", alpha=0.7, color="red")
+        plt.title("📉 Loss Curve - Rainbow DQN")
+        plt.xlabel("Training Step")
+        plt.ylabel("Loss")
+        plt.grid()
+        plt.tight_layout()
+        plt.savefig("rainbow_outputs/loss_plot.png")
+
+    print("📊 Saved loss & reward plots under rainbow_outputs")
+
     return agent
 
+# ---------- EVALUATION (PRINT SUMMARY) ----------
+def evaluate_and_report(agent, n_eps=20):
+    env = gym.make(ENV_NAME)
+    outcomes = {"LANDED_OK": 0, "CRASH": 0, "OUT_OF_BOUNDS": 0, "ASLEEP": 0, "UNKNOWN": 0, "DONE": 0}
+    rewards = []
+
+    for ep in range(n_eps):
+        obs, _ = env.reset()
+        ep_reward = 0
+        while True:
+            with torch.no_grad():
+                state_v = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+                dist = agent.online(state_v)
+                q_vals = torch.sum(dist * agent.z, dim=2)
+                action = q_vals.argmax(1).item()
+
+            obs, reward, term, trunc, _ = env.step(action)
+            ep_reward += reward
+
+            if term or trunc:
+                reason = termination_reason(env, obs)
+                outcomes[reason] += 1
+                rewards.append(ep_reward)
+                break
+
+    env.close()
+
+    print("\n=== Evaluation Summary ===")
+    for k, v in outcomes.items():
+        print(f"{k:>15}: {v}")
+    print(f"Mean Reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}")
+
+# -------------------- Run --------------------
 if __name__ == '__main__':
-    trained = train(episodes=400)
-    torch.save(trained.online.state_dict(), 'rainbow_c51_lunar_v3.pth')
+    agent = train(episodes=400)
+    evaluate_and_report(agent, n_eps=20)
