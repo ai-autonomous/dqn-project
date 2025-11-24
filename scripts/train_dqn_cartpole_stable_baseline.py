@@ -176,15 +176,17 @@ def train_double_dqn(total_steps, stage_size, lr):
             "MlpPolicy", env,
             learning_rate=lr,
             buffer_size=50_000,
-            batch_size=32,
+            batch_size=128,
+            tau=1.0,
             gamma=0.99,
             train_freq=4,
-            target_update_interval=250,
-            exploration_fraction=0.1,
-            exploration_final_eps=0.01,
+            gradient_steps=1,
+            target_update_interval=500,
+            exploration_fraction=0.4,
+            exploration_final_eps=0.05,
             verbose=1, seed=0,
             tensorboard_log=TB_LOG,
-            device=DEVICE, policy_kwargs=dict(net_arch=[128, 128]),
+            device=DEVICE, policy_kwargs=dict(net_arch=[256, 256]),
         )
 
     stages = total_steps // stage_size
