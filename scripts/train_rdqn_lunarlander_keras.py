@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # Rainbow DQN (PyTorch) for LunarLander-v3
 
 import gymnasium as gym
@@ -17,18 +18,19 @@ ENV_NAME = "LunarLander-v3"
 SEED = 42
 GAMMA = 0.99
 N_ATOMS = 51
-V_MIN = -200.0
-V_MAX = 200.0
+V_MIN = -300.0
+V_MAX = 300.0
 N_STEPS = 3
 BUFFER_SIZE = 100_000
 BATCH_SIZE = 64
-LR = 1e-4
-UPDATE_TARGET_EVERY = 1000
+LR = 5e-4
+UPDATE_TARGET_EVERY = 500
 TRAIN_START = 1000
+TRAIN_EVERY = 1
 MAX_FRAMES = 400_000
 PRIORITY_ALPHA = 0.6
 PRIORITY_BETA_START = 0.4
-PRIORITY_BETA_FRAMES = 200_000
+PRIORITY_BETA_FRAMES = 100_000
 
 # Track Metrics
 ALL_REWARDS = []
@@ -217,6 +219,42 @@ def projection_distribution(next_dist, rewards, dones, gamma):
     delta_z = float(V_MAX - V_MIN) / (N_ATOMS - 1)
     support = torch.linspace(V_MIN, V_MAX, N_ATOMS)
 
+    rewards = rewards.unsqueeze(1)  # (B,1)
+    dones = dones.unsqueeze(1)      # (B,1)
+
+    # Tz: (B, atoms)
+    Tz = rewards + gamma * support.unsqueeze(0) * (1.0 - dones)
+    Tz = Tz.clamp(min=V_MIN, max=V_MAX)
+
+    b = (Tz - V_MIN) / delta_z
+    l = b.floor().long()
+    u = b.ceil().long()
+
+    l = l.clamp(0, N_ATOMS - 1)
+    u = u.clamp(0, N_ATOMS - 1)
+
+    offset = (torch.arange(batch_size) * N_ATOMS).unsqueeze(1)
+
+    proj = torch.zeros((batch_size * N_ATOMS,))
+    next_dist_flat = next_dist.reshape(-1)
+
+    eq_mask = (u == l)
+    if eq_mask.any():
+        idxs = (l + offset).view(-1)[eq_mask.view(-1)]
+        proj.index_add_(0, idxs, next_dist_flat[eq_mask.view(-1)])
+
+    ne_mask = ~eq_mask
+    if ne_mask.any():
+        l_idxs = (l + offset).view(-1)[ne_mask.view(-1)]
+        u_idxs = (u + offset).view(-1)[ne_mask.view(-1)]
+        b_flat = b.view(-1)[ne_mask.view(-1)]
+        dist_flat = next_dist_flat[ne_mask.view(-1)]
+        proj.index_add_(0, l_idxs, dist_flat * (u.view(-1)[ne_mask.view(-1)].float() - b_flat))
+        proj.index_add_(0, u_idxs, dist_flat * (b_flat - l.view(-1)[ne_mask.view(-1)].float()))
+
+    proj = proj.view(batch_size, N_ATOMS)
+    return proj
+
     for i in range(batch_size):
         for j in range(N_ATOMS):
             Tz = rewards[i].item() + (gamma * support[j].item()) * (1.0 - dones[i].item())
@@ -324,7 +362,8 @@ def train(episodes=800):
             action = agent.select_action(state)
             next_state, reward, terminated, truncated, _ = env.step(action)
             done_flag = terminated or truncated
-            agent.replay.push(state, action, reward, next_state, done_flag)
+            scaled_reward = float(reward) / 10.0
+            agent.replay.push(state, action, scaled_reward, next_state, done_flag)
             state = next_state
             ep_reward += reward
             frame += 1
@@ -352,7 +391,7 @@ def train(episodes=800):
     # ---------- Save Graphs ----------
     plt.figure(figsize=(8, 4))
     plt.plot(ALL_REWARDS, marker="o", alpha=0.7, color="blue")
-    plt.title("📈 Reward Per Episode - Rainbow")
+    plt.title("?? Reward Per Episode - Rainbow")
     plt.xlabel("Episode")
     plt.ylabel("Reward")
     plt.grid()
@@ -362,14 +401,14 @@ def train(episodes=800):
     if ALL_LOSSES:
         plt.figure(figsize=(8, 4))
         plt.plot(ALL_LOSSES, marker="o", alpha=0.7, color="red")
-        plt.title("📉 Loss Curve - Rainbow DQN")
+        plt.title("?? Loss Curve - Rainbow DQN")
         plt.xlabel("Training Step")
         plt.ylabel("Loss")
         plt.grid()
         plt.tight_layout()
         plt.savefig("rainbow_outputs/loss_plot.png")
 
-    print("📊 Saved loss & reward plots under rainbow_outputs")
+    print("?? Saved loss & reward plots under rainbow_outputs")
 
     return agent
 
@@ -403,7 +442,7 @@ def evaluate_and_report(agent, n_eps=20):
     print("\n=== Evaluation Summary ===")
     for k, v in outcomes.items():
         print(f"{k:>15}: {v}")
-    print(f"Mean Reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}")
+    print(f"Mean Reward: {np.mean(rewards):.2f} +/- {np.std(rewards):.2f}")
 
 # -------------------- Run --------------------
 if __name__ == '__main__':
