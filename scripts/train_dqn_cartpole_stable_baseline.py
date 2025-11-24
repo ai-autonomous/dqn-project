@@ -109,40 +109,57 @@ def quality_heuristic(obs, terminated, truncated, steps, max_steps):
     return "UNSTABLE"
 
 
-# ========= ENV FACTORY =========
+# ---------- ENV FACTORY ----------
 def make_env(seed=0, record=False, video_name="best_cartpole"):
-    env = gym.make(ENV_NAME, render_mode="rgb_array" if record else None)
+    # NOTE: must always use rgb_array if we might record later
+    env = gym.make(ENV_NAME, render_mode="rgb_array")
+
     if record:
-        env = RecordVideo(env, VIDEO_DIR, name_prefix=video_name)
+        env = RecordVideo(
+            env,
+            VIDEO_DIR,
+            name_prefix=video_name,
+            episode_trigger=lambda episode_id: True,   # record every episode in this env
+            disable_logger=True
+        )
+
     env = Monitor(env)
     env.reset(seed=seed)
     return env
 
 
-# ========= RECORD BEST VIDEO =========
-best_reward = -999999
+# ---------- BEST VIDEO RECORDER ----------
+best_reward = -np.inf
 
 def record_best_video(model):
     global best_reward
-    env = make_env(seed=777, record=True, video_name="best_cartpole_episode")
+
+    # Always create a fresh recording env (1 episode only)
+    env = make_env(seed=777, record=True, video_name="best_cartpole")
     obs, _ = env.reset()
     total_r, steps = 0, 0
 
     while True:
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, term, trunc, _ = env.step(action)
-        total_r += reward; steps += 1
+        total_r += reward
+        steps += 1
         if term or trunc:
             break
-    env.close()
 
+    # VERY IMPORTANT flush & close properly
+    try:
+        env.close()
+    except Exception:
+        pass
+
+    # Only keep if better
     if total_r > best_reward:
         best_reward = total_r
-        print(f"🎥 Saved BEST VIDEO! Reward={total_r:.2f}, Steps={steps}")
+        print(f"🎥 BEST VIDEO SAVED! Reward={total_r:.2f}, Steps={steps}")
     else:
-        for f in os.listdir(VIDEO_DIR):
-            if "best_cartpole_episode" in f:
-                os.remove(os.path.join(VIDEO_DIR, f))
+        # do not delete; simply next best will overwrite prefix names
+        print(f"⚠️ Better score not achieved. Video skipped. Reward={total_r:.2f}")
 
 
 # ========= TRAIN =========
