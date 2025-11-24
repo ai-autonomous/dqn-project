@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import torch
 import warnings
 
+from gymnasium.wrappers import RecordVideo
 from stable_baselines3 import DQN
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
@@ -30,7 +31,9 @@ ENV_NAME = "LunarLander-v3"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 MODEL_DIR = "models"
+VIDEO_DIR = os.path.join(MODEL_DIR, "best_video")
 os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(VIDEO_DIR, exist_ok=True)
 MODEL_PATH = os.path.join(MODEL_DIR, "dqn_lunarlander_v3.zip")
 
 LOSS_CSV = os.path.join(MODEL_DIR, "loss_log.csv")
@@ -55,8 +58,7 @@ class LossLogger(BaseCallback):
         info = self.locals.get("infos", [{}])[0]
         if "episode" in info:  # episode ended
             if self.current_losses:
-                avg_loss = np.mean(self.current_losses)
-                self.episode_losses.append(avg_loss)
+                self.episode_losses.append(np.mean(self.current_losses))
             self.current_losses = []  # reset for next episode
 
         return True
@@ -100,13 +102,15 @@ def termination_reason(env, obs):
 
 
 # ---------- ENV FACTORY ----------
-def make_env(seed=0):
-    env = gym.make(ENV_NAME)
+def make_env(seed=0, record=False, tag=""):
+    env = gym.make(ENV_NAME, render_mode="rgb_array" if record else None)
+    if record:
+        env = RecordVideo(env, VIDEO_DIR, name_prefix=f"best_landing_{tag}")
     env = Monitor(env)
     env.reset(seed=seed)
     return env
 
-
+best_reward_global = -9999 # global best episode recorder
 # ---------- TRAINING ----------
 def train_dqn(total_steps, stage_size, lr):
     env, eval_env = make_env(0), make_env(100)
@@ -136,6 +140,8 @@ def train_dqn(total_steps, stage_size, lr):
     reward_progress = []
     stages = total_steps // stage_size
 
+    global best_reward_global
+
     for s in range(stages):
         print(f"\n=== 🧠 Stage {s+1}/{stages} → {stage_size:,} steps ===")
         model.learn(stage_size, reset_num_timesteps=False,
@@ -145,6 +151,11 @@ def train_dqn(total_steps, stage_size, lr):
         mean_r, std_r = evaluate_policy(model, eval_env, 10)
         reward_progress.append(mean_r)
         print(f"📈 Eval: mean={mean_r:.2f} ± {std_r:.2f}")
+
+        if mean_r > best_reward_global:
+            print(f"🎥 NEW BEST AVERAGE REWARD ({mean_r}) → Recording episode")
+            best_reward_global = mean_r
+            record_best_video(model)
 
     # Save loss plots
     loss_logger.save()
@@ -163,6 +174,18 @@ def train_dqn(total_steps, stage_size, lr):
 
     env.close(); eval_env.close()
     return model
+
+# ---------- RECORD BEST VIDEO ----------
+def record_best_video(model):
+    env = make_env(1234, record=True, tag="best")
+    obs, _ = env.reset()
+
+    while True:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, _, term, trunc, _ = env.step(action)
+        if term or trunc:
+            break
+    env.close()
 
 
 # ---------- EVALUATION (PRINT + PLOT) ----------
@@ -195,9 +218,8 @@ def evaluate_and_report(model, n_eps=20):
     print(f"Mean Reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}")
 
     # Bar Plot
-    labels, counts = list(outcomes.keys()), list(outcomes.values())
     plt.figure(figsize=(6, 4))
-    plt.bar(labels, counts, color="lightgreen")
+    plt.bar(list(outcomes.keys()), list(outcomes.values()), color="lightgreen")
     plt.title("🚀 LunarLander Episode Outcomes")
     plt.ylabel("Count")
     plt.xticks(rotation=30)
@@ -212,3 +234,4 @@ if __name__ == "__main__":
     model = train_dqn(args.total_steps, args.stage_size, args.lr)
     evaluate_and_report(model, 20)
     print("🎉 Done!")
+    print("🎉 Done! Video saved in:", VIDEO_DIR)
