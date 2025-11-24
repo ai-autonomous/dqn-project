@@ -3,6 +3,15 @@ name: Deep Q Learning Workflow
 on:
   workflow_dispatch:
     inputs:
+      approach:
+        description: "Choose the approach"
+        required: true
+        type: choice
+        options:
+          - stable_baseline
+          - keras
+        default: "stable_baseline"
+
       algorithm:
         description: "Choose the RL algorithm"
         required: true
@@ -22,15 +31,6 @@ on:
           - cartpole
           - recsim
         default: "lunarlander"
-      
-      approach:
-        description: "Choose the approach"
-        required: true
-        type: choice
-        options:
-          - stable_baseline
-          - keras
-        default: "stable_baseline"
 
       total_steps:
         description: "Total training timesteps"
@@ -63,7 +63,7 @@ jobs:
         with:
           python-version: "3.13"
 
-      # Step 3 — Install system-level deps
+      # Step 3 — Install system-level dependencies
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y swig
 
@@ -73,14 +73,38 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
 
-      - name: Print Workflow Inputs
+      # Step 5 — Validation & Print Info
+      - name: Validate Inputs & Print System Info
+        env:
+          ALGO: ${{ github.event.inputs.algorithm }}
+          APPROACH: ${{ github.event.inputs.approach }}
         run: |
-          echo "=== WORKFLOW INPUTS START ==="
-          echo "algorithm: ${{ github.event.inputs.algorithm }}"
-          echo "environment: ${{ github.event.inputs.environment }}"
-          echo "=== WORKFLOW INPUTS END ==="
+          echo "=== WORKFLOW INPUT VALIDATION ==="
+          if [ "$APPROACH" = "stable_baseline" ] && [ "$ALGO" != "dqn" ]; then
+            echo "❌ Error: Only DQN is supported with Stable Baseline."
+            echo "You selected: $ALGO under approach: $APPROACH"
+            exit 1
+          fi
+          echo "✔️ Input validation passed!"
 
-      # Step 5 — Build training filename and execute
+          echo "=== RUNNER SYSTEM INFO ==="
+          echo "🖥️ OS Release:"
+          cat /etc/os-release
+
+          echo "🔧 CPU Info:"
+          lscpu | grep -E 'Model name|CPU\(s\)|Thread|MHz'
+
+          echo "💾 Memory Info:"
+          free -h
+
+          echo "🎨 GPU Info:"
+          if command -v nvidia-smi &> /dev/null; then
+            nvidia-smi
+          else
+            echo "⚠️ No NVIDIA GPU available on this runner."
+          fi
+
+      # Step 6 — Run Training
       - name: Run RL Training
         env:
           ALGO: ${{ github.event.inputs.algorithm }}
@@ -91,33 +115,17 @@ jobs:
           LEARNING_RATE: ${{ github.event.inputs.learning_rate }}
         run: |
           echo "🚀 Starting RL Training"
-          echo "🧠 Algorithm: $ALGO"
-          echo "🌍 Environment: $ENV_NAME"
-          echo "🌍 Approach: $APPROACH"
-          echo "🔢 Total Steps: $TOTAL_STEPS"
-          echo "📦 Stage Size: $STAGE_SIZE"
-          echo "💡 Learning Rate: $LEARNING_RATE"
-
           FILE="scripts/train_${ALGO}_${ENV_NAME}_${APPROACH}.py"
-          echo "📄 Running script: $FILE"
-
-          if [ ! -f "$FILE" ]; then
-            echo "❌ ERROR: $FILE not found!"
-            exit 1
-          fi
-
           PYTHONWARNINGS=ignore python "$FILE" \
             --total_steps $TOTAL_STEPS \
             --stage_size $STAGE_SIZE \
             --lr $LEARNING_RATE > train_log.txt
 
-      # Step 6 — Show summary
+      # Step 7 — Show Summary
       - name: Show Training Summary
-        run: |
-          echo "📊 Final Training Summary (last 50 lines):"
-          tail -n 50 train_log.txt
+        run: tail -n 50 train_log.txt
 
-      # Step 7 — Upload model
+      # Step 8 — Upload Models
       - name: Upload trained model
         uses: actions/upload-artifact@v4
         with:
