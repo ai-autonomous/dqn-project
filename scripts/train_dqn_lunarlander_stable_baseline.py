@@ -1,8 +1,5 @@
 """
-DQN LunarLander-v3 with:
-✔ Best-episode video recording (not first landing!)
-✔ Auto GitHub artifact upload support
-✔ Loss & reward tracking + evaluation summary plots
+DQN training with loss & reward tracking + evaluation summary plots
 DO NOT REMOVE: Evaluation summary print section
 """
 
@@ -37,15 +34,15 @@ MODEL_DIR = "models"
 VIDEO_DIR = os.path.join(MODEL_DIR, "best_video")
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
-
 MODEL_PATH = os.path.join(MODEL_DIR, "dqn_lunarlander_v3.zip")
+
 LOSS_CSV = os.path.join(MODEL_DIR, "loss_log.csv")
 REWARD_CSV = os.path.join(MODEL_DIR, "reward_log.csv")
 
 
 # ---------- LOSS LOGGER ----------
 class LossLogger(BaseCallback):
-    """Collect average DQN loss per episode and plot it."""
+    """Collect average DQN loss per episode."""
 
     def __init__(self, verbose=0):
         super().__init__(verbose)
@@ -57,17 +54,18 @@ class LossLogger(BaseCallback):
         if loss is not None:
             self.current_losses.append(loss)
 
-        # Detect episode end
+        # Detect new episode (Monitor wrapper logs episode end in info)
         info = self.locals.get("infos", [{}])[0]
-        if "episode" in info:
+        if "episode" in info:  # episode ended
             if self.current_losses:
                 self.episode_losses.append(np.mean(self.current_losses))
-            self.current_losses = []
+            self.current_losses = []  # reset for next episode
+
         return True
 
     def save(self):
         if not self.episode_losses:
-            print("⚠ No episode losses logged.")
+            print("⚠️ No episode loss values tracked.")
             return
 
         pd.DataFrame({"episode_loss": self.episode_losses}).to_csv(LOSS_CSV, index=False)
@@ -80,11 +78,13 @@ class LossLogger(BaseCallback):
         plt.grid()
         plt.tight_layout()
         plt.savefig(os.path.join(MODEL_DIR, "loss_plot.png"))
-        print("💾 Saved episode loss plot!")
+        print("💾 Saved episode loss logs & plot!")
+
 
 
 # ---------- TERMINATION REASON ----------
 def termination_reason(env, obs):
+    """Detect landing outcome in LunarLander-v3"""
     um = env.unwrapped
     try:
         x_pos = float(obs[0])
@@ -110,10 +110,8 @@ def make_env(seed=0, record=False, tag=""):
     env.reset(seed=seed)
     return env
 
-
+best_reward_global = -9999 # global best episode recorder
 # ---------- TRAINING ----------
-best_reward_global = -9999  # global best episode recorder
-
 def train_dqn(total_steps, stage_size, lr):
     env, eval_env = make_env(0), make_env(100)
 
@@ -154,16 +152,15 @@ def train_dqn(total_steps, stage_size, lr):
         reward_progress.append(mean_r)
         print(f"📈 Eval: mean={mean_r:.2f} ± {std_r:.2f}")
 
-        # 🎥 Save video only if best stage reward improves
         if mean_r > best_reward_global:
             print(f"🎥 NEW BEST AVERAGE REWARD ({mean_r}) → Recording episode")
             best_reward_global = mean_r
             record_best_video(model)
 
-    # Loss plots
+    # Save loss plots
     loss_logger.save()
 
-    # Reward plots
+    # Save Reward CSV + Plot
     pd.DataFrame({"reward": reward_progress}).to_csv(REWARD_CSV, index=False)
     plt.figure(figsize=(8, 4))
     plt.plot(np.arange(1, stages + 1), reward_progress, marker="o")
@@ -173,11 +170,10 @@ def train_dqn(total_steps, stage_size, lr):
     plt.grid()
     plt.tight_layout()
     plt.savefig(os.path.join(MODEL_DIR, "training_reward_plot.png"))
-    print("💾 Saved reward progression plot!")
+    print("💾 Saved reward logs & plot!")
 
     env.close(); eval_env.close()
     return model
-
 
 # ---------- RECORD BEST VIDEO ----------
 def record_best_video(model):
@@ -192,7 +188,7 @@ def record_best_video(model):
     env.close()
 
 
-# ---------- EVALUATION (DO NOT REMOVE) ----------
+# ---------- EVALUATION (PRINT + PLOT) ----------
 def evaluate_and_report(model, n_eps=20):
     env = make_env(999)
     outcomes = {"LANDED_OK": 0, "CRASH": 0,
@@ -215,6 +211,7 @@ def evaluate_and_report(model, n_eps=20):
 
     env.close()
 
+    # 📌 DO NOT REMOVE: PRINT SUMMARY
     print("\n=== Evaluation Summary ===")
     for k, v in outcomes.items():
         print(f"{k:>15}: {v}")
@@ -236,4 +233,5 @@ if __name__ == "__main__":
     print(f"🚀 Training on {ENV_NAME} | Steps={args.total_steps:,} | LR={args.lr}")
     model = train_dqn(args.total_steps, args.stage_size, args.lr)
     evaluate_and_report(model, 20)
+    print("🎉 Done!")
     print("🎉 Done! Video saved in:", VIDEO_DIR)
