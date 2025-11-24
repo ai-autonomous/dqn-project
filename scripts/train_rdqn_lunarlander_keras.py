@@ -1,332 +1,450 @@
-import random
-from collections import deque
-import os
-import argparse
+# -*- coding: utf-8 -*-
+# Rainbow DQN (PyTorch) for LunarLander-v3
 
 import gymnasium as gym
 import numpy as np
+import random
+from collections import deque, namedtuple
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 import matplotlib.pyplot as plt
-import pandas as pd
+import os
 
-import tensorflow as tf
-from tensorflow import keras
-import Box2D  # DO NOT REMOVE
-
-# =========================
-# Device Selection (CPU/GPU/Metal Auto)
-# =========================
-gpus = tf.config.list_physical_devices('GPU')
-if len(gpus) > 0:
-    DEVICE = "/GPU:0"   # NVIDIA CUDA or Apple Metal (tensorflow-metal)
-else:
-    DEVICE = "/CPU:0"
-print(f"🔧 Using TensorFlow device: {DEVICE}")
-
-# =========================
-# Reproducibility
-# =========================
+# -------------------- Hyperparameters --------------------
+ENV_NAME = "LunarLander-v3"
 SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-tf.random.set_seed(SEED)
+GAMMA = 0.99
+N_ATOMS = 51
+V_MIN = -300.0
+V_MAX = 300.0
+N_STEPS = 3
+BUFFER_SIZE = 100_000
+BATCH_SIZE = 64
+LR = 5e-4
+UPDATE_TARGET_EVERY = 500
+TRAIN_START = 1000
+TRAIN_EVERY = 1
+MAX_FRAMES = 400_000
+PRIORITY_ALPHA = 0.6
+PRIORITY_BETA_START = 0.4
+PRIORITY_BETA_FRAMES = 100_000
 
-# =========================
-# Hyperparameter Helpers
-# =========================
-def discount_rate():  # Gamma
-    return 1
+# Track Metrics
+ALL_REWARDS = []
+ALL_LOSSES = []
 
-def batch_size():
-    return 128
+# -------------------- Utilities --------------------
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-# =========================
-# Environment
-# =========================
-envLunar = gym.make('LunarLander-v3')
-envLunar.reset(seed=SEED)
-envLunar.action_space.seed(SEED)
-envLunar.observation_space.seed(SEED)
+set_seed(SEED)
 
-# =========================
-# Prioritized Replay Buffer
-# =========================
-class PrioritizedReplayBuffer:
-    def __init__(self, capacity, alpha=0.6):
+# ---------- TERMINATION REASON ----------
+def termination_reason(env, obs):
+    """Detect landing outcome in LunarLander-v3"""
+    um = env.unwrapped
+    try:
+        x_pos = float(obs[0])
+        if getattr(um, "game_over", False):
+            return "CRASH"
+        elif abs(x_pos) >= 2.5:
+            return "OUT_OF_BOUNDS"
+        elif not bool(um.lander.awake):
+            left, right = int(obs[6]), int(obs[7])
+            return "LANDED_OK" if left == 1 and right == 1 else "ASLEEP"
+        else:
+            return "UNKNOWN"
+    except:
+        return "DONE"
+
+# -------------------- Noisy Linear --------------------
+class NoisyLinear(nn.Module):
+    def __init__(self, in_features, out_features, sigma_init=0.5):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.register_buffer('weight_epsilon', torch.empty(out_features, in_features))
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+        self.register_buffer('bias_epsilon', torch.empty(out_features))
+        self.sigma_init = sigma_init
+        self.reset_parameters()
+        self.reset_noise()
+
+    def reset_parameters(self):
+        mu_range = 1 / math.sqrt(self.in_features)
+        self.weight_mu.data.uniform_(-mu_range, mu_range)
+        self.weight_sigma.data.fill_(self.sigma_init / math.sqrt(self.in_features))
+        self.bias_mu.data.uniform_(-mu_range, mu_range)
+        self.bias_sigma.data.fill_(self.sigma_init / math.sqrt(self.out_features))
+
+    def _scale_noise(self, size):
+        x = torch.randn(size)
+        return x.sign().mul_(x.abs().sqrt_())
+
+    def reset_noise(self):
+        epsilon_in = self._scale_noise(self.in_features)
+        epsilon_out = self._scale_noise(self.out_features)
+        self.weight_epsilon.copy_(epsilon_out.ger(epsilon_in))
+        self.bias_epsilon.copy_(epsilon_out)
+
+    def forward(self, x):
+        if self.training:
+            weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
+        else:
+            weight = self.weight_mu
+            bias = self.bias_mu
+        return F.linear(x, weight, bias)
+
+# -------------------- Dueling C51 Network --------------------
+class RainbowC51(nn.Module):
+    def __init__(self, state_dim, action_dim, atoms=N_ATOMS):
+        super().__init__()
+        self.action_dim = action_dim
+        self.atoms = atoms
+
+        self.fc1 = nn.Linear(state_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+
+        self.val_fc = NoisyLinear(256, 128)
+        self.val_out = NoisyLinear(128, atoms)
+
+        self.adv_fc = NoisyLinear(256, 128)
+        self.adv_out = NoisyLinear(128, action_dim * atoms)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+
+        v = F.relu(self.val_fc(x))
+        v = self.val_out(v).view(-1, 1, self.atoms)
+
+        a = F.relu(self.adv_fc(x))
+        a = self.adv_out(a).view(-1, self.action_dim, self.atoms)
+
+        q_atoms = v + a - a.mean(1, keepdim=True)
+        dist = F.softmax(q_atoms, dim=2)
+        dist = dist.clamp(min=1e-6)
+        return dist
+
+    def reset_noise(self):
+        self.val_fc.reset_noise(); self.val_out.reset_noise()
+        self.adv_fc.reset_noise(); self.adv_out.reset_noise()
+
+# -------------------- PER + N-step --------------------
+class PrioritizedReplayNstep:
+    def __init__(self, capacity, n_step=N_STEPS, gamma=GAMMA, alpha=PRIORITY_ALPHA):
         self.capacity = capacity
+        self.n_step = n_step
+        self.gamma = gamma
         self.alpha = alpha
+        
         self.buffer = []
         self.pos = 0
         self.priorities = np.zeros((capacity,), dtype=np.float32)
 
+        self.nstep_queue = deque(maxlen=n_step)
+        self.Transition = namedtuple('Transition', ['s', 'a', 'r', 'ns', 'd'])
+
+    def _get_n_step_info(self):
+        reward, next_state, done = 0, None, None
+        for idx, (_, _, r, ns, d) in enumerate(self.nstep_queue):
+            reward += (self.gamma ** idx) * r
+            next_state = ns
+            done = d
+            if d:
+                break
+        return reward, next_state, done
+
     def push(self, state, action, reward, next_state, done):
+        self.nstep_queue.append((state, action, reward, next_state, done))
+        if len(self.nstep_queue) < self.n_step:
+            return
+        s, a, _, _, _ = self.nstep_queue[0]
+        R, ns, d = self._get_n_step_info()
+        transition = self.Transition(s, a, R, ns, d)
         max_prio = self.priorities.max() if self.buffer else 1.0
+
         if len(self.buffer) < self.capacity:
-            self.buffer.append((state, action, reward, next_state, done))
+            self.buffer.append(transition)
         else:
-            self.buffer[self.pos] = (state, action, reward, next_state, done)
+            self.buffer[self.pos] = transition
+
         self.priorities[self.pos] = max_prio
         self.pos = (self.pos + 1) % self.capacity
 
     def sample(self, batch_size, beta=0.4):
-        prios = self.priorities if len(self.buffer) == self.capacity else self.priorities[:self.pos]
+        if len(self.buffer) == 0:
+            return None
+
+        prios = self.priorities[:len(self.buffer)]
+        prios = np.maximum(prios, 1e-6)
         probs = prios ** self.alpha
         probs /= probs.sum()
 
         indices = np.random.choice(len(self.buffer), batch_size, p=probs)
-        samples = [self.buffer[idx] for idx in indices]
+        samples = [self.buffer[i] for i in indices]
+        batch = self.Transition(*zip(*samples))
 
-        total = len(self.buffer)
-        weights = (total * probs[indices]) ** (-beta)
+        weights = (len(self.buffer) * probs[indices]) ** (-beta)
         weights /= weights.max()
-        weights = weights.astype(np.float32)
 
-        states, actions, rewards, next_states, dones = zip(*samples)
-        return (
-            np.array(states),
-            np.array(actions),
-            np.array(rewards),
-            np.array(next_states),
-            np.array(dones, dtype=np.float32),
-            indices,
-            weights,
-        )
+        states = torch.tensor(np.array(batch.s), dtype=torch.float32)
+        actions = torch.tensor(batch.a, dtype=torch.long)
+        rewards = torch.tensor(batch.r, dtype=torch.float32)
+        next_states = torch.tensor(np.array(batch.ns), dtype=torch.float32)
+        dones = torch.tensor(batch.d, dtype=torch.float32)
 
-    def update_priorities(self, batch_indices, batch_priorities):
-        for idx, prio in zip(batch_indices, batch_priorities):
-            self.priorities[idx] = prio
+        return states, actions, rewards, next_states, dones, indices, torch.tensor(weights, dtype=torch.float32)
+
+    def update_priorities(self, indices, priorities):
+        for idx, p in zip(indices, priorities):
+            self.priorities[idx] = p
 
     def __len__(self):
         return len(self.buffer)
 
-# =========================
-# Rainbow-Style DQN Agent
-# =========================
-class RainbowDQN:
-    def __init__(self, states, actions, alpha, gamma,
-                 epsilon, epsilon_min, epsilon_decay,
-                 buffer_size=50000, n_step=3,
-                 per_alpha=0.6, per_beta_start=0.4, per_beta_frames=100000):
+# -------------------- Distributional projection (C51) --------------------
+def projection_distribution(next_dist, rewards, dones, gamma):
+    batch_size = rewards.size(0)
+    proj_dist = torch.zeros((batch_size, N_ATOMS), dtype=torch.float32)
+    delta_z = float(V_MAX - V_MIN) / (N_ATOMS - 1)
+    support = torch.linspace(V_MIN, V_MAX, N_ATOMS)
 
-        self.nS = states
-        self.nA = actions
-        self.gamma = gamma
-        self.alpha = alpha
+    rewards = rewards.unsqueeze(1)  # (B,1)
+    dones = dones.unsqueeze(1)      # (B,1)
 
-        self.epsilon = epsilon
-        self.epsilon_min = epsilon_min
-        self.epsilon_decay = epsilon_decay
+    # Tz: (B, atoms)
+    Tz = rewards + gamma * support.unsqueeze(0) * (1.0 - dones)
+    Tz = Tz.clamp(min=V_MIN, max=V_MAX)
 
-        self.memory = PrioritizedReplayBuffer(buffer_size, alpha=per_alpha)
-        self.per_beta_start = per_beta_start
-        self.per_beta_frames = per_beta_frames
-        self.frame_idx = 1
+    b = (Tz - V_MIN) / delta_z
+    l = b.floor().long()
+    u = b.ceil().long()
 
-        self.n_step = n_step
-        self.n_gamma = gamma ** n_step
-        self.n_step_buffer = deque(maxlen=n_step)
+    l = l.clamp(0, N_ATOMS - 1)
+    u = u.clamp(0, N_ATOMS - 1)
 
-        with tf.device(DEVICE):
-            self.model = self.build_model()
-            self.model_target = self.build_model()
-            self.update_target_from_model()
+    offset = (torch.arange(batch_size) * N_ATOMS).unsqueeze(1)
 
-        self.loss = []
+    proj = torch.zeros((batch_size * N_ATOMS,))
+    next_dist_flat = next_dist.reshape(-1)
 
-    def build_model(self):
-        inputs = keras.layers.Input(shape=(self.nS,))
-        x = keras.layers.Dense(128, activation='relu')(inputs)
-        x = keras.layers.Dense(128, activation='relu')(x)
+    eq_mask = (u == l)
+    if eq_mask.any():
+        idxs = (l + offset).view(-1)[eq_mask.view(-1)]
+        proj.index_add_(0, idxs, next_dist_flat[eq_mask.view(-1)])
 
-        V = keras.layers.Dense(1)(x)
-        A = keras.layers.Dense(self.nA)(x)
+    ne_mask = ~eq_mask
+    if ne_mask.any():
+        l_idxs = (l + offset).view(-1)[ne_mask.view(-1)]
+        u_idxs = (u + offset).view(-1)[ne_mask.view(-1)]
+        b_flat = b.view(-1)[ne_mask.view(-1)]
+        dist_flat = next_dist_flat[ne_mask.view(-1)]
+        proj.index_add_(0, l_idxs, dist_flat * (u.view(-1)[ne_mask.view(-1)].float() - b_flat))
+        proj.index_add_(0, u_idxs, dist_flat * (b_flat - l.view(-1)[ne_mask.view(-1)].float()))
 
-        A_mean = keras.layers.Lambda(lambda a: tf.reduce_mean(a, axis=1, keepdims=True))(A)
-        Q = keras.layers.Add()([V, keras.layers.Subtract()([A, A_mean])])
+    proj = proj.view(batch_size, N_ATOMS)
+    return proj
 
-        model = keras.Model(inputs=inputs, outputs=Q)
-        model.compile(loss='mean_squared_error', optimizer=keras.optimizers.Adam(learning_rate=self.alpha))
-        return model
-
-    def update_target_from_model(self):
-        self.model_target.set_weights(self.model.get_weights())
-
-    def _get_beta(self):
-        return min(1.0, self.per_beta_start +
-                   (1.0 - self.per_beta_start) * (self.frame_idx / float(self.per_beta_frames)))
-
-    def action(self, state):
-        if np.random.rand() <= self.epsilon:
-            return random.randrange(self.nA)
-        with tf.device(DEVICE):
-            q_vals = self.model.predict(state.reshape(1, -1), verbose=0)
-        return int(np.argmax(q_vals[0]))
-
-    def _store_n_step(self, transition):
-        self.n_step_buffer.append(transition)
-        if len(self.n_step_buffer) < self.n_step:
-            return None
-        R = sum((self.gamma ** i) * t[2] for i, t in enumerate(self.n_step_buffer))
-        s, a, _, _, _ = self.n_step_buffer[0]
-        _, _, _, ns, d = self.n_step_buffer[-1]
-        return (s, a, R, ns, d)
-
-    def remember(self, state, action, reward, nstate, done):
-        n = self._store_n_step((state, action, reward, nstate, done))
-        if n:
-            self.memory.push(*n)
-
-    def experience_replay(self, batch_size):
-        if len(self.memory) < batch_size:
-            return
-
-        beta = self._get_beta()
-        self.frame_idx += 1
-
-        states, actions, rewards, next_states, dones, indices, weights = self.memory.sample(batch_size, beta)
-
-        with tf.device(DEVICE):
-            q_st = self.model.predict(states, verbose=0)
-            q_next_online = self.model.predict(next_states, verbose=0)
-            q_next_target = self.model_target.predict(next_states, verbose=0)
-
-        td_errors = np.zeros(batch_size, dtype=np.float32)
-        for i in range(batch_size):
-            a = actions[i]
-            done = dones[i]
-            r = rewards[i]
-            target = q_st[i]
-            if done:
-                y = r
+    for i in range(batch_size):
+        for j in range(N_ATOMS):
+            Tz = rewards[i].item() + (gamma * support[j].item()) * (1.0 - dones[i].item())
+            Tz = max(V_MIN, min(V_MAX, Tz))
+            b = (Tz - V_MIN) / delta_z
+            l = math.floor(b)
+            u = math.ceil(b)
+            if l == u:
+                proj_dist[i, l] += next_dist[i, j]
             else:
-                best_a = np.argmax(q_next_online[i])
-                y = r + (self.gamma ** self.n_step) * q_next_target[i][best_a]
-            td_errors[i] = y - target[a]
-            target[a] = y
-            q_st[i] = target
+                proj_dist[i, l] += next_dist[i, j] * (u - b)
+                proj_dist[i, u] += next_dist[i, j] * (b - l)
+    return proj_dist
 
-        weights = weights.squeeze()
+# -------------------- Agent / Training Loop --------------------
+class RainbowAgent:
+    def __init__(self, state_dim, action_dim, device):
+        self.device = device
+        self.action_dim = action_dim
+        self.z = torch.linspace(V_MIN, V_MAX, N_ATOMS).to(device)
+        self.delta_z = (V_MAX - V_MIN) / (N_ATOMS - 1)
 
-        with tf.device(DEVICE):
-            hist = self.model.fit(states, q_st, epochs=1, verbose=0,
-                                  batch_size=batch_size, sample_weight=weights)
+        self.online = RainbowC51(state_dim, action_dim).to(device)
+        self.target = RainbowC51(state_dim, action_dim).to(device)
+        self.target.load_state_dict(self.online.state_dict())
+        self.optimizer = optim.Adam(self.online.parameters(), lr=LR)
 
-        self.loss.append(hist.history['loss'][0])
-        self.memory.update_priorities(indices, np.abs(td_errors) + 1e-6)
+        self.replay = PrioritizedReplayNstep(BUFFER_SIZE)
+        self.beta_start = PRIORITY_BETA_START
+        self.beta_frames = PRIORITY_BETA_FRAMES
+        self.frame_idx = 0
 
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+    def select_action(self, state):
+        state_v = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            dist = self.online(state_v)
+            q_vals = torch.sum(dist * self.z, dim=2)
+            action = q_vals.argmax(1).item()
+        return action
 
-# =========================
-# Create and Train Rainbow Agent
-# =========================
+    def train_step(self):
+        if len(self.replay) < BATCH_SIZE:
+            return None
+        self.frame_idx += 1
+        beta = min(1.0, self.beta_start + (1.0 - self.beta_start) * (self.frame_idx / float(self.beta_frames)))
+        samples = self.replay.sample(BATCH_SIZE, beta)
+        if samples is None:
+            return None
+        states, actions, rewards, next_states, dones, idxs, weights = samples
+        states = states.to(self.device)
+        next_states = next_states.to(self.device)
+        actions = actions.to(self.device)
+        rewards = rewards.to(self.device)
+        dones = dones.to(self.device)
+        weights = weights.to(self.device)
 
-MODEL_DIR = "keras_rainbow_ddqn_models"
-os.makedirs(MODEL_DIR, exist_ok=True)
-MODEL_PATH = os.path.join(MODEL_DIR, "rainbow_lunarlander_v3.h5")
+        with torch.no_grad():
+            next_dist = self.online(next_states)
+            next_q = torch.sum(next_dist * self.z, dim=2)
+            next_actions = next_q.argmax(1)
+            next_dist_target = self.target(next_states)
+            next_dist_target_a = next_dist_target[range(BATCH_SIZE), next_actions]
 
-parser = argparse.ArgumentParser(description="Train Rainbow DQN on LunarLander-v3")
-parser.add_argument("--total_steps", type=int, default=500)
-parser.add_argument("--stage_size", type=int, default=500)
-parser.add_argument("--lr", type=float, default=5e-4)
-args = parser.parse_args()
+            proj_dist = projection_distribution(next_dist_target_a, rewards, dones, GAMMA ** N_STEPS)
+            proj_dist = proj_dist.to(self.device)
 
-EPISODES = args.total_steps
-MAX_STEPS = args.stage_size
-LR = args.lr
-TARGET_SYNC_EVERY = 1
-SOLVE_LINE = 200.0
+        dist = self.online(states)
+        dist_a = dist[range(BATCH_SIZE), actions]
 
-nS = envLunar.observation_space.shape[0]
-nA = envLunar.action_space.n
+        loss = - (proj_dist * dist_a.log()).sum(1)
+        loss = (weights * loss).mean()
 
-rainbow = RainbowDQN(nS, nA, LR, discount_rate(),
-                     epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.995)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
-batch = batch_size()
-rewards, epsilons, losses = [], [], []
+        with torch.no_grad():
+            expected = torch.sum(dist_a * self.z, dim=1)
+            target_expected = torch.sum(proj_dist * self.z, dim=1)
+            td_errors = (expected - target_expected).abs().cpu().numpy()
+        self.replay.update_priorities(idxs, td_errors + 1e-6)
 
-for e in range(EPISODES):
-    state, _ = envLunar.reset(seed=SEED + e)
-    total_reward = 0.0
+        self.online.reset_noise(); self.target.reset_noise()
+        return loss.item()
 
-    for t in range(MAX_STEPS):
-        action = rainbow.action(state)
-        nstate, r, terminated, truncated, _ = envLunar.step(action)
-        done = terminated or truncated
+    def update_target(self):
+        self.target.load_state_dict(self.online.state_dict())
 
-        rainbow.remember(state, action, r, nstate, done)
-        rainbow.experience_replay(batch)
+# -------------------- Main Training --------------------
+def train(episodes=800):
+    env = gym.make(ENV_NAME, disable_env_checker=True)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
 
-        state = nstate
-        total_reward += r
-        if done:
-            break
+    agent = RainbowAgent(state_dim, action_dim, device)
 
-    rewards.append(total_reward)
-    epsilons.append(rainbow.epsilon)
-    losses.append(rainbow.loss[-1] if rainbow.loss else np.nan)
+    frame = 0
+    for ep in range(episodes):
+        state, _ = env.reset()
+        ep_reward = 0
+        done = False
 
-    if (e + 1) % TARGET_SYNC_EVERY == 0:
-        rainbow.update_target_from_model()
+        while not done:
+            action = agent.select_action(state)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done_flag = terminated or truncated
+            scaled_reward = float(reward) / 10.0
+            agent.replay.push(state, action, scaled_reward, next_state, done_flag)
+            state = next_state
+            ep_reward += reward
+            frame += 1
 
-    print(f"[Episode {e+1}] reward={total_reward:.2f} epsilon={rainbow.epsilon:.3f} last_loss={losses[-1]:.6f}")
+            if frame > TRAIN_START:
+                loss = agent.train_step()
+                if loss is not None:
+                    ALL_LOSSES.append(loss)
 
-# Save Model
-with tf.device(DEVICE):
-    rainbow.model.save(MODEL_PATH)
-print(f"\n💾 Saved Rainbow Model → {MODEL_PATH}")
+            if frame % UPDATE_TARGET_EVERY == 0:
+                agent.update_target()
 
-# =========================
-# TEST AND METRIC SUMMARY
-# =========================
-TEST_EPISODES = 20
-test_rewards = []
-metrics = {k: 0 for k in ["LANDED_OK", "CRASHED", "OUT_OF_BOUNDS", "ASLEEP", "UNKNOWN", "DONE"]}
+            if done_flag:
+                break
 
-for te in range(TEST_EPISODES):
-    s, _ = envLunar.reset(seed=SEED + 1000 + te)
-    ep_r, done = 0.0, False
+        ALL_REWARDS.append(ep_reward)
+        print(f"Episode {ep} Frame {frame} Reward {ep_reward}")
 
-    while not done:
-        with tf.device(DEVICE):
-            q_vals = rainbow.model.predict(s.reshape(1, -1), verbose=0)
-        a = int(np.argmax(q_vals[0]))
-        s, r, terminated, truncated, info = envLunar.step(a)
-        done = terminated or truncated
-        ep_r += r
+    env.close()
 
-    reason = info.get("termination_reason", "").upper()
-    if "LAND" in reason: metrics["LANDED_OK"] += 1
-    elif "CRASH" in reason: metrics["CRASHED"] += 1
-    elif "OUT" in reason: metrics["OUT_OF_BOUNDS"] += 1
-    elif "ASLEEP" in reason: metrics["ASLEEP"] += 1
-    elif "DONE" in reason: metrics["DONE"] += 1
-    else: metrics["UNKNOWN"] += 1
+    # ---------- Save Model ----------
+    os.makedirs("rainbow_outputs", exist_ok=True)
+    torch.save(agent.online.state_dict(), "rainbow_outputs/rainbow_c51_lunar_v3.pth")
 
-    test_rewards.append(ep_r)
+    # ---------- Save Graphs ----------
+    plt.figure(figsize=(8, 4))
+    plt.plot(ALL_REWARDS, marker="o", alpha=0.7, color="blue")
+    plt.title("?? Reward Per Episode - Rainbow")
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.grid()
+    plt.tight_layout()
+    plt.savefig("rainbow_outputs/reward_plot.png")
 
-print("\n==== 🧪 TEST SUMMARY ====")
-for k, v in metrics.items(): print(f"{k}: {v}")
-print(f"\nMean Reward: {np.mean(test_rewards):.2f} ± {np.std(test_rewards):.2f}")
+    if ALL_LOSSES:
+        plt.figure(figsize=(8, 4))
+        plt.plot(ALL_LOSSES, marker="o", alpha=0.7, color="red")
+        plt.title("?? Loss Curve - Rainbow DQN")
+        plt.xlabel("Training Step")
+        plt.ylabel("Loss")
+        plt.grid()
+        plt.tight_layout()
+        plt.savefig("rainbow_outputs/loss_plot.png")
 
-# =========================
-# SAVE GRAPHS + CSV
-# =========================
-pd.DataFrame({"reward": rewards, "epsilon": epsilons, "loss": losses}).to_csv(
-    os.path.join(MODEL_DIR, "training_data.csv"), index=False)
+    print("?? Saved loss & reward plots under rainbow_outputs")
 
-plt.figure(figsize=(12,5))
-plt.plot(rewards); plt.title("Episode Rewards"); plt.grid()
-plt.savefig(os.path.join(MODEL_DIR, "reward_plot.png"))
+    return agent
 
-plt.figure(figsize=(12,4))
-plt.plot(epsilons); plt.title("Epsilon Decay"); plt.grid()
-plt.savefig(os.path.join(MODEL_DIR, "epsilon_plot.png"))
+# ---------- EVALUATION (PRINT SUMMARY) ----------
+def evaluate_and_report(agent, n_eps=20):
+    env = gym.make(ENV_NAME)
+    outcomes = {"LANDED_OK": 0, "CRASH": 0, "OUT_OF_BOUNDS": 0, "ASLEEP": 0, "UNKNOWN": 0, "DONE": 0}
+    rewards = []
 
-if not np.all(np.isnan(losses)):
-    plt.figure(figsize=(12,4))
-    plt.plot(losses); plt.title("Loss per Episode"); plt.grid()
-    plt.savefig(os.path.join(MODEL_DIR, "loss_plot.png"))
+    for ep in range(n_eps):
+        obs, _ = env.reset()
+        ep_reward = 0
+        while True:
+            with torch.no_grad():
+                state_v = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+                dist = agent.online(state_v)
+                q_vals = torch.sum(dist * agent.z, dim=2)
+                action = q_vals.argmax(1).item()
 
-print("\n📊 Saved all graphs & training CSV!")
-print("\n🎉 RAINBOW TRAINING + TEST COMPLETE!\n")
+            obs, reward, term, trunc, _ = env.step(action)
+            ep_reward += reward
+
+            if term or trunc:
+                reason = termination_reason(env, obs)
+                outcomes[reason] += 1
+                rewards.append(ep_reward)
+                break
+
+    env.close()
+
+    print("\n=== Evaluation Summary ===")
+    for k, v in outcomes.items():
+        print(f"{k:>15}: {v}")
+    print(f"Mean Reward: {np.mean(rewards):.2f} +/- {np.std(rewards):.2f}")
+
+# -------------------- Run --------------------
+if __name__ == '__main__':
+    agent = train(episodes=400)
+    evaluate_and_report(agent, n_eps=20)
