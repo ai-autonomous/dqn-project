@@ -1,16 +1,16 @@
 """
 DQN training for CartPole-v1 (Stable-Baselines3)
 ------------------------------------------------
-FEATURES:
-  • Stability classification:
-        ➤ SOLVED (full 500 steps + stable posture)
-        ➤ GOOD_RUN (≥450 steps + stable)
-        ➤ FAIL (fell early)
-        ➤ TIME_LIMIT (survived but unstable)
-        ➤ UNSTABLE (ran but not stable enough)
-  • Saves BEST video ONLY if classified SOLVED
-  • Plots Avg Loss & Training Reward
-  • Prints final 20-episode performance summary
+Updated:
+  • Uses official-like termination classification:
+        ➤ SOLVED (500 steps full timeout)
+        ➤ GOOD_RUN (≥195 steps and terminated)
+        ➤ TIME_LIMIT (full time but not guaranteed stable)
+        ➤ FAIL (fell or out of bounds)
+        ➤ UNKNOWN (other end conditions)
+  • Saves BEST video ONLY if SOLVED
+  • Tracks Avg Loss + Reward plot
+  • Prints final 20-episode outcome summary
 """
 
 import os
@@ -61,7 +61,7 @@ class LossLogger(BaseCallback):
             self.current_losses.append(loss)
 
         info = self.locals.get("infos", [{}])[0]
-        if "episode" in info:  # episode ended
+        if "episode" in info:  # new episode
             if self.current_losses:
                 self.episode_losses.append(np.mean(self.current_losses))
             self.current_losses = []
@@ -80,31 +80,19 @@ class LossLogger(BaseCallback):
         print("💾 Saved loss plot!")
 
 
-# ========= STABILITY HEURISTIC =========
-def classify_outcome(obs, terminated, truncated, steps, max_steps):
-    """CartPole-v1 stability classification"""
-    x, x_dot, theta, theta_dot = obs
-
-    # posture thresholds
-    angle_ok   = abs(theta) < 0.04  # < 2.3°
-    ang_vel_ok = abs(theta_dot) < 0.15
-    pos_ok     = abs(x) < 0.7
-    vel_ok     = abs(x_dot) < 0.7
-    stable = angle_ok and ang_vel_ok and pos_ok and vel_ok
-
-    if truncated and steps == max_steps and stable:
-        return "SOLVED"
-
-    if terminated:
-        return "FAIL"
-
+# ========= OFFICIAL TERMINATION REASON =========
+def termination_reason(terminated, truncated, steps, max_steps):
+    """Classify episode termination reason (Gymnasium logic based)"""
     if truncated and steps == max_steps:
-        return "TIME_LIMIT"
-
-    if steps >= 450 and stable:
-        return "GOOD_RUN"
-
-    return "UNSTABLE"
+        return "SOLVED"          # Completed full 500 steps
+    elif truncated:
+        return "TIME_LIMIT"      # Interrupted earlier, but not terminal failure
+    elif terminated and steps >= 195:
+        return "GOOD_RUN"        # Classic CartPole-v0 success limit
+    elif terminated:
+        return "FAIL"            # Fell or went out of bounds
+    else:
+        return "UNKNOWN"
 
 
 # ---------- ENV FACTORY ----------
@@ -113,16 +101,16 @@ def make_env(seed=0, record=False, fname="best_cartpole"):
     if record:
         env = RecordVideo(
             env, VIDEO_DIR, name_prefix=fname,
-            episode_trigger=lambda _: True, disable_logger=True
+            episode_trigger=lambda _: True,
+            disable_logger=True
         )
     env = Monitor(env)
     env.reset(seed=seed)
     return env
 
 
-# ---------- VIDEO SAVER ----------
+# ---------- VIDEO SAVER (Only SOLVED) ----------
 def save_best_video(model):
-    """Record only if the episode is SOLVED"""
     env = make_env(seed=777, record=True, fname="best_cartpole")
     obs,_ = env.reset()
     total_r, steps = 0,0
@@ -132,15 +120,15 @@ def save_best_video(model):
         obs,rew,term,trunc,_ = env.step(action)
         total_r += rew; steps += 1
         if term or trunc:
-            outcome = classify_outcome(obs, term, trunc, steps, env.env.spec.max_episode_steps)
+            outcome = termination_reason(term, trunc, steps, env.env.spec.max_episode_steps)
             break
 
     env.close()
 
     if outcome == "SOLVED":
-        print(f"🎥 VIDEO SAVED (SOLVED episode: {steps} steps, reward={total_r:.2f})")
+        print(f"🎥 VIDEO SAVED ✔ (SOLVED episode: {steps} steps, reward={total_r:.2f})")
     else:
-        print(f"⚠️ Not SOLVED ({outcome}), video discarded")
+        print(f"⚠️ Not SOLVED ({outcome}), video discarded ❌")
 
 
 # ========= TRAIN =========
@@ -155,12 +143,17 @@ def train_dqn(total_steps, stage_size, lr):
         print("🆕 Creating new model...")
         model = DQN(
             "MlpPolicy", env,
-            learning_rate=lr, buffer_size=50_000, batch_size=128,
-            tau=1.0, gamma=0.99, train_freq=4, gradient_steps=1,
-            target_update_interval=500, exploration_fraction=0.4,
-            exploration_final_eps=0.05, verbose=1, seed=0,
+            learning_rate=lr,
+            buffer_size=50_000, batch_size=128,
+            tau=1.0, gamma=0.99,
+            train_freq=4, gradient_steps=1,
+            target_update_interval=500,
+            exploration_fraction=0.4,
+            exploration_final_eps=0.05,
+            verbose=1, seed=0,
             tensorboard_log=TB_LOG,
-            device=DEVICE, policy_kwargs=dict(net_arch=[256,256]),
+            device=DEVICE,
+            policy_kwargs=dict(net_arch=[256,256]),
         )
 
     rewards_track = []
@@ -175,7 +168,7 @@ def train_dqn(total_steps, stage_size, lr):
         rewards_track.append(mean_r)
         print(f"📈 Eval Mean Reward: {mean_r:.2f}")
 
-        save_best_video(model)  # 🎥 Only SOLVED
+        save_best_video(model)
 
     loss_logger.save_plot()
 
@@ -194,8 +187,7 @@ def train_dqn(total_steps, stage_size, lr):
 def evaluate_summary(model, n_episodes=20):
     env = make_env(seed=999)
     max_steps = env.env.spec.max_episode_steps
-
-    summary = {"SOLVED":0, "GOOD_RUN":0, "UNSTABLE":0, "FAIL":0, "TIME_LIMIT":0}
+    summary = {"SOLVED":0, "GOOD_RUN":0, "TIME_LIMIT":0, "FAIL":0, "UNKNOWN":0}
     rewards = []
 
     for _ in range(n_episodes):
@@ -206,7 +198,7 @@ def evaluate_summary(model, n_episodes=20):
             obs,rew,term,trunc,_ = env.step(action)
             total_r += rew; steps += 1
             if term or trunc:
-                outcome = classify_outcome(obs, term, trunc, steps, max_steps)
+                outcome = termination_reason(term, trunc, steps, max_steps)
                 summary[outcome] += 1
                 rewards.append(total_r)
                 break
@@ -224,4 +216,4 @@ def evaluate_summary(model, n_episodes=20):
 if __name__ == "__main__":
     model = train_dqn(args.total_steps, args.stage_size, args.lr)
     evaluate_summary(model, 20)
-    print(f"🎉 Finished! Videos (if any) are stored in: {VIDEO_DIR}")
+    print(f"🎉 Finished! Videos (only SOLVED) stored in: {VIDEO_DIR}")
