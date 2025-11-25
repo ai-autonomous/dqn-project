@@ -115,6 +115,13 @@ jobs:
           LEARNING_RATE: ${{ github.event.inputs.learning_rate }}
         run: |
           echo "🚀 Starting RL Training"
+          echo "🧠 Algorithm: $ALGO"
+          echo "🌍 Environment: $ENV_NAME"
+          echo "🌍 Approach: $APPROACH"
+          echo "🔢 Total Steps: $TOTAL_STEPS"
+          echo "📦 Stage Size: $STAGE_SIZE"
+          echo "💡 Learning Rate: $LEARNING_RATE"
+          
           FILE="scripts/train_${ALGO}_${ENV_NAME}_${APPROACH}.py"
           PYTHONWARNINGS=ignore python "$FILE" \
             --total_steps $TOTAL_STEPS \
