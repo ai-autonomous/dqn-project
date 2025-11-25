@@ -1,12 +1,13 @@
 """
-Adaptive DQN for CartPole-v1 (Stable-Baselines3)
+DQN training for CartPole-v1 (Stable-Baselines3)
 ------------------------------------------------
-Features:
-  • 🎥 Save best video ONLY when heuristically classified as SOLVED
-  • 📌 Adaptive heuristic thresholds tighten as performance increases
-  • 📉 Average loss per episode
-  • 📈 Mean reward progression per training stage
-  • 🧪 Evaluation (Official + Heuristic)
+FEATURES:
+  • Heuristic stability classification:
+        ➤ SOLVED (full episode 500 steps + stable)
+        ➤ GOOD_RUN (≥450 steps)
+        ➤ FAIL (fell early)
+  • Saves BEST video ONLY when classified SOLVED
+  • Tracks & plots average loss & training reward
 """
 
 import os
@@ -21,17 +22,16 @@ from stable_baselines3.common.evaluation import evaluate_policy
 import torch
 import matplotlib.pyplot as plt
 import warnings
-
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 
-# ================= CLI Inputs =================
+# ========= CLI Inputs =========
 parser = argparse.ArgumentParser(description="Train DQN on CartPole-v1")
 parser.add_argument("--total_steps", type=int, default=300_000)
 parser.add_argument("--stage_size", type=int, default=50_000)
 parser.add_argument("--lr", type=float, default=5e-4)
 args = parser.parse_args()
 
-# ================= Config =================
+# ========= Config =========
 ENV_NAME = "CartPole-v1"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -43,11 +43,14 @@ TB_LOG = "./tb_dqn_cartpole_v1"
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 
-# ================= Loss Logger =================
+print(f"🚀 Training DQN on {ENV_NAME} | Device: {DEVICE}")
+
+# ========= LOSS LOGGER =========
 class LossLogger(BaseCallback):
     def __init__(self, verbose=0):
         super().__init__(verbose)
-        self.episode_losses, self.current_losses = [], []
+        self.episode_losses = []
+        self.current_losses = []
 
     def _on_step(self) -> bool:
         loss = self.model.logger.name_to_value.get("train/loss")
@@ -55,7 +58,7 @@ class LossLogger(BaseCallback):
             self.current_losses.append(loss)
 
         info = self.locals.get("infos", [{}])[0]
-        if "episode" in info:
+        if "episode" in info:  # episode ended
             if self.current_losses:
                 self.episode_losses.append(np.mean(self.current_losses))
             self.current_losses = []
@@ -66,76 +69,78 @@ class LossLogger(BaseCallback):
             print("⚠️ No loss tracked.")
             return
         plt.figure(figsize=(8, 4))
-        plt.plot(self.episode_losses, marker="o", color="red")
-        plt.title("📉 Average Loss Per Episode (DQN)")
-        plt.xlabel("Episode")
-        plt.ylabel("Avg Loss")
+        plt.plot(self.episode_losses, marker="o", alpha=0.8, color="red")
+        plt.title("📉 Average Loss Per Episode (CartPole)")
+        plt.xlabel("Episode"); plt.ylabel("Avg Loss")
         plt.grid(); plt.tight_layout()
         plt.savefig(os.path.join(MODEL_DIR, "loss_plot_cartpole.png"))
         print("💾 Saved loss plot!")
 
-# ================= Adaptive Heuristic =================
-def adaptive_thresholds(mean_reward: float):
-    tighten = min(0.8, max(0, (mean_reward - 100) / 200))
-    return {
-        "theta": 0.07 - 0.04 * tighten,
-        "theta_dot": 0.25 - 0.10 * tighten,
-        "x": 0.9 - 0.3 * tighten,
-        "x_dot": 0.9 - 0.3 * tighten,
-    }
 
-def heuristic_eval(obs, terminated, truncated, steps, max_steps, mean_reward):
+# ========= STABILITY HEURISTIC =========
+def classify_outcome(obs, terminated, truncated, steps, max_steps):
+    """CartPole-v1 stability classification (500 step limit)"""
     x, x_dot, theta, theta_dot = obs
-    th = adaptive_thresholds(mean_reward)
 
-    stable = (abs(theta) < th["theta"] and abs(theta_dot) < th["theta_dot"] and
-              abs(x) < th["x"] and abs(x_dot) < th["x_dot"])
+    # stable posture
+    angle_ok   = abs(theta) < 0.04        # < 2.3°
+    ang_vel_ok = abs(theta_dot) < 0.15
+    pos_ok     = abs(x) < 0.7
+    vel_ok     = abs(x_dot) < 0.7
+    stable = angle_ok and ang_vel_ok and pos_ok and vel_ok
 
     if truncated and steps == max_steps and stable:
-        return "SOLVED"
-    if terminated and stable and steps >= 195:
-        return "GOOD_RUN"
+        return "SOLVED"      # best possible
+
     if terminated:
-        return "FAIL"
+        return "FAIL"        # fell early
+
+    if truncated and steps == max_steps:
+        return "TIME_LIMIT"  # survived but unstable
+
+    if steps >= 450 and stable:  # strong run for v1
+        return "GOOD_RUN"
+
     return "UNSTABLE"
 
-# ================= Environment Factory =================
-def make_env(seed=0, record=False, vid_name="best_cartpole"):
+
+# ---------- ENV FACTORY ----------
+def make_env(seed=0, record=False, fname="best_cartpole"):
     env = gym.make(ENV_NAME, render_mode="rgb_array")
     if record:
-        env = RecordVideo(env, VIDEO_DIR, name_prefix=vid_name,
-                          episode_trigger=lambda e: True, disable_logger=True)
+        env = RecordVideo(
+            env, VIDEO_DIR, name_prefix=fname,
+            episode_trigger=lambda _: True, disable_logger=True
+        )
     env = Monitor(env)
     env.reset(seed=seed)
     return env
 
-# ================= Video Recorder =================
-best_reward = -np.inf
 
-def record_if_solved(model, mean_reward):
-    global best_reward
-    env = make_env(seed=777, record=True)
+# ---------- VIDEO SAVER ----------
+def save_best_video(model):
+    """Record only if the episode is SOLVED"""
+    env = make_env(seed=777, record=True, fname="best_cartpole")
     obs,_ = env.reset()
-    total_r, steps = 0, 0
-    max_steps = env.env.spec.max_episode_steps
+    total_r, steps = 0,0
 
     while True:
-        last_obs = obs.copy()
         action,_ = model.predict(obs, deterministic=True)
-        obs,reward,term,trunc,_ = env.step(action)
-        total_r += reward; steps += 1
+        obs,rew,term,trunc,_ = env.step(action)
+        total_r += rew; steps += 1
         if term or trunc:
-            outcome = heuristic_eval(last_obs, term, trunc, steps, max_steps, mean_reward)
+            outcome = classify_outcome(obs, term, trunc, steps, env.env.spec.max_episode_steps)
             break
 
     env.close()
-    if outcome == "SOLVED" and total_r > best_reward:
-        best_reward = total_r
-        print(f"🎥 SOLVED! Video saved. Reward={total_r:.2f}")
-    else:
-        print(f"⏭  No SOLVED video (Result={outcome}, R={total_r:.1f})")
 
-# ================= TRAIN =================
+    if outcome == "SOLVED":
+        print(f"🎥 VIDEO SAVED (SOLVED episode: {steps} steps, reward={total_r:.2f})")
+    else:
+        print(f"⚠️ Not SOLVED ({outcome}), video discarded")
+
+
+# ========= TRAIN =========
 def train_dqn(total_steps, stage_size, lr):
     env, eval_env = make_env(0), make_env(100)
     loss_logger = LossLogger()
@@ -144,35 +149,35 @@ def train_dqn(total_steps, stage_size, lr):
         print("📦 Loading existing model...")
         model = DQN.load(MODEL_PATH, env=env)
     else:
-        print("🆕 Creating new DQN model...")
+        print("🆕 Creating new model...")
         model = DQN(
             "MlpPolicy", env,
             learning_rate=lr, buffer_size=50_000, batch_size=128,
             tau=1.0, gamma=0.99, train_freq=4, gradient_steps=1,
             target_update_interval=500, exploration_fraction=0.4,
             exploration_final_eps=0.05, verbose=1, seed=0,
-            tensorboard_log=TB_LOG, device=DEVICE,
-            policy_kwargs=dict(net_arch=[256, 256]),
+            tensorboard_log=TB_LOG,
+            device=DEVICE, policy_kwargs=dict(net_arch=[256,256]),
         )
 
+    rewards_track = []
     stages = total_steps // stage_size
-    reward_track = []
 
     for s in range(stages):
-        print(f"\n=== Stage {s+1}/{stages} — {stage_size:,} steps ===")
+        print(f"\n=== 🧠 Stage {s+1}/{stages} — {stage_size:,} steps ===")
         model.learn(stage_size, reset_num_timesteps=False, callback=loss_logger)
         model.save(MODEL_PATH)
 
-        mean_r, std_r = evaluate_policy(model, eval_env, 10)
-        reward_track.append(mean_r)
-        print(f"📈 Eval: {mean_r:.2f} ± {std_r:.2f}")
+        mean_r,_ = evaluate_policy(model, eval_env, 10)
+        rewards_track.append(mean_r)
+        print(f"📈 Eval Mean Reward: {mean_r:.2f}")
 
-        record_if_solved(model, mean_r)
+        save_best_video(model)  # 🎥 Only SOLVED runs saved
 
     loss_logger.save_plot()
 
-    plt.figure(figsize=(8, 4))
-    plt.plot(reward_track, marker="o")
+    plt.figure(figsize=(8,4))
+    plt.plot(rewards_track, marker="o")
     plt.title("📈 Mean Reward During Training (CartPole)")
     plt.xlabel("Stage"); plt.ylabel("Mean Reward")
     plt.grid(); plt.tight_layout()
@@ -181,30 +186,8 @@ def train_dqn(total_steps, stage_size, lr):
     env.close(); eval_env.close()
     return model
 
-# ================= Evaluation =================
-def evaluate(model, n=20):
-    env = make_env(999)
-    max_steps = env.env.spec.max_episode_steps
-    metrics = {"SOLVED":0, "GOOD_RUN":0, "UNSTABLE":0, "FAIL":0}
 
-    for _ in range(n):
-        obs,_ = env.reset()
-        total_r, steps = 0, 0
-        while True:
-            last_obs = obs.copy()
-            action,_ = model.predict(obs, deterministic=True)
-            obs,reward,term,trunc,_ = env.step(action)
-            total_r += reward; steps += 1
-            if term or trunc:
-                metrics[heuristic_eval(last_obs, term, trunc, steps, max_steps, np.mean([100,200]))] += 1
-                break
-    env.close()
-
-    print("\n=== 🧪 Heuristic Evaluation ===")
-    for k,v in metrics.items(): print(f"{k:>12}: {v}")
-
-# ================= MAIN =================
+# ========= MAIN =========
 if __name__ == "__main__":
     model = train_dqn(args.total_steps, args.stage_size, args.lr)
-    evaluate(model)
-    print("🎉 Done!")
+    print(f"🎉 Finished! Videos (if any) saved in {VIDEO_DIR}")
