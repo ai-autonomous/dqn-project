@@ -79,6 +79,11 @@ jobs:
           ALGO: ${{ github.event.inputs.algorithm }}
           APPROACH: ${{ github.event.inputs.approach }}
         run: |
+          echo "=== WORKFLOW INPUTS START ==="
+          echo "algorithm: ${{ github.event.inputs.algorithm }}"
+          echo "environment: ${{ github.event.inputs.environment }}"
+          echo "=== WORKFLOW INPUTS END ==="
+          
           echo "=== WORKFLOW INPUT VALIDATION ==="
           if [ "$APPROACH" = "stable_baseline" ] && [ "$ALGO" != "dqn" ]; then
             echo "❌ Error: Only DQN is supported with Stable Baseline."
@@ -121,7 +126,7 @@ jobs:
           echo "🔢 Total Steps: $TOTAL_STEPS"
           echo "📦 Stage Size: $STAGE_SIZE"
           echo "💡 Learning Rate: $LEARNING_RATE"
-          
+
           FILE="scripts/train_${ALGO}_${ENV_NAME}_${APPROACH}.py"
           PYTHONWARNINGS=ignore python "$FILE" \
             --total_steps $TOTAL_STEPS \
