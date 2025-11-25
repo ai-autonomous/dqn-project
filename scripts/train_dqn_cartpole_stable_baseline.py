@@ -144,7 +144,7 @@ def train_dqn(total_steps, stage_size, lr):
         model = DQN(
             "MlpPolicy", env,
             learning_rate=lr,
-            buffer_size=50_000, batch_size=128,
+            buffer_size=50_000, batch_size=32,
             tau=1.0, gamma=0.99,
             train_freq=4, gradient_steps=1,
             target_update_interval=500,
