@@ -2,12 +2,15 @@
 DQN training for CartPole-v1 (Stable-Baselines3)
 ------------------------------------------------
 FEATURES:
-  • Heuristic stability classification:
-        ➤ SOLVED (full episode 500 steps + stable)
-        ➤ GOOD_RUN (≥450 steps)
+  • Stability classification:
+        ➤ SOLVED (full 500 steps + stable posture)
+        ➤ GOOD_RUN (≥450 steps + stable)
         ➤ FAIL (fell early)
-  • Saves BEST video ONLY when classified SOLVED
-  • Tracks & plots average loss & training reward
+        ➤ TIME_LIMIT (survived but unstable)
+        ➤ UNSTABLE (ran but not stable enough)
+  • Saves BEST video ONLY if classified SOLVED
+  • Plots Avg Loss & Training Reward
+  • Prints final 20-episode performance summary
 """
 
 import os
@@ -79,26 +82,26 @@ class LossLogger(BaseCallback):
 
 # ========= STABILITY HEURISTIC =========
 def classify_outcome(obs, terminated, truncated, steps, max_steps):
-    """CartPole-v1 stability classification (500 step limit)"""
+    """CartPole-v1 stability classification"""
     x, x_dot, theta, theta_dot = obs
 
-    # stable posture
-    angle_ok   = abs(theta) < 0.04        # < 2.3°
+    # posture thresholds
+    angle_ok   = abs(theta) < 0.04  # < 2.3°
     ang_vel_ok = abs(theta_dot) < 0.15
     pos_ok     = abs(x) < 0.7
     vel_ok     = abs(x_dot) < 0.7
     stable = angle_ok and ang_vel_ok and pos_ok and vel_ok
 
     if truncated and steps == max_steps and stable:
-        return "SOLVED"      # best possible
+        return "SOLVED"
 
     if terminated:
-        return "FAIL"        # fell early
+        return "FAIL"
 
     if truncated and steps == max_steps:
-        return "TIME_LIMIT"  # survived but unstable
+        return "TIME_LIMIT"
 
-    if steps >= 450 and stable:  # strong run for v1
+    if steps >= 450 and stable:
         return "GOOD_RUN"
 
     return "UNSTABLE"
@@ -172,7 +175,7 @@ def train_dqn(total_steps, stage_size, lr):
         rewards_track.append(mean_r)
         print(f"📈 Eval Mean Reward: {mean_r:.2f}")
 
-        save_best_video(model)  # 🎥 Only SOLVED runs saved
+        save_best_video(model)  # 🎥 Only SOLVED
 
     loss_logger.save_plot()
 
@@ -187,7 +190,38 @@ def train_dqn(total_steps, stage_size, lr):
     return model
 
 
+# ========= FINAL EVALUATION SUMMARY =========
+def evaluate_summary(model, n_episodes=20):
+    env = make_env(seed=999)
+    max_steps = env.env.spec.max_episode_steps
+
+    summary = {"SOLVED":0, "GOOD_RUN":0, "UNSTABLE":0, "FAIL":0, "TIME_LIMIT":0}
+    rewards = []
+
+    for _ in range(n_episodes):
+        obs,_ = env.reset()
+        total_r, steps = 0,0
+        while True:
+            action,_ = model.predict(obs, deterministic=True)
+            obs,rew,term,trunc,_ = env.step(action)
+            total_r += rew; steps += 1
+            if term or trunc:
+                outcome = classify_outcome(obs, term, trunc, steps, max_steps)
+                summary[outcome] += 1
+                rewards.append(total_r)
+                break
+    env.close()
+
+    print("\n=== 🧪 Final Evaluation (20 Episodes) ===")
+    for k,v in summary.items():
+        print(f"{k:>12}: {v}")
+    print(f"\n📌 Mean Reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}")
+
+    return summary
+
+
 # ========= MAIN =========
 if __name__ == "__main__":
     model = train_dqn(args.total_steps, args.stage_size, args.lr)
-    print(f"🎉 Finished! Videos (if any) saved in {VIDEO_DIR}")
+    evaluate_summary(model, 20)
+    print(f"🎉 Finished! Videos (if any) are stored in: {VIDEO_DIR}")
