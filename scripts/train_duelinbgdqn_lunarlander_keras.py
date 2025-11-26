@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Rainbow DQN (PyTorch) for LunarLander-v3
+# Dueling DQN (PyTorch) for LunarLander-v3
 
 import gymnasium as gym
 import numpy as np
