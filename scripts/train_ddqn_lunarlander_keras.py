@@ -54,9 +54,6 @@ MODEL_PATH = os.path.join(MODEL_DIR, "dqn_lunarlander_v3.zip")
 LOSS_CSV = os.path.join(MODEL_DIR, "loss_log.csv")
 REWARD_CSV = os.path.join(MODEL_DIR, "reward_log.csv")
 
-MODEL_DIR = "ddqn_outputs"
-os.makedirs(MODEL_DIR, exist_ok=True)
-
 LOSS_CSV = os.path.join(MODEL_DIR, "loss_log.csv")
 
 # ----------------- Utilities -----------------
@@ -391,8 +388,7 @@ def evaluate_and_report(agent: DDQNAgent, n_eps: int = 20):
     plt.bar(labels, counts)
     plt.title("LunarLander Episode Outcomes")
     plt.tight_layout()
-    plt.savefig(MODEL_DIR / "evaluation_summary.png")
-    print(f"Saved evaluation plot to {MODEL_DIR / 'evaluation_summary.png'}")
+    plt.savefig(MODEL_DIR, "evaluation_summary.png")
 
 
 # ----------------- Run -----------------
