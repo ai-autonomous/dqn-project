@@ -19,7 +19,7 @@ on:
         options:
           - dqn
           - ddqn
-          - rdqn
+          - duelingdqn
         default: "dqn"
 
       environment:
