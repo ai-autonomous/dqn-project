@@ -56,6 +56,16 @@ jobs:
       # Step 1 — Checkout repo
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Free up disk space on runner
+        run: |
+          echo "📦 Cleaning up space..."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h
       
       # -----------------------------
       # Python version switches here
