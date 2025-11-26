@@ -54,6 +54,11 @@ MODEL_PATH = os.path.join(MODEL_DIR, "dqn_lunarlander_v3.zip")
 LOSS_CSV = os.path.join(MODEL_DIR, "loss_log.csv")
 REWARD_CSV = os.path.join(MODEL_DIR, "reward_log.csv")
 
+MODEL_DIR = "ddqn_outputs"
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+LOSS_CSV = os.path.join(MODEL_DIR, "loss_log.csv")
+
 # ----------------- Utilities -----------------
 
 def set_seed(seed: int):
@@ -315,7 +320,7 @@ def train(total_steps, stage_size, lr):
     plt.ylabel("Reward")
     plt.grid()
     plt.tight_layout()
-    plt.savefig("ddqn_outputs/reward_plot.png")
+    plt.savefig(os.path.join(MODEL_DIR, "reward_plot.png"))
 
     if ALL_LOSSES:
         plt.figure(figsize=(8, 4))
@@ -325,7 +330,7 @@ def train(total_steps, stage_size, lr):
         plt.ylabel("Loss")
         plt.grid()
         plt.tight_layout()
-        plt.savefig("ddqn_outputs/loss_plot.png")
+        plt.savefig(os.path.join(MODEL_DIR, "loss_plot.png"))
 
     print("📊 Saved loss & reward plots under ddqn_outputs")
     return agent, ALL_REWARDS, ALL_LOSSES
