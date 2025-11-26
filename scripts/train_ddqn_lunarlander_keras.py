@@ -1,245 +1,406 @@
-import random
-from collections import deque
+# DDQN LunarLander Implementation - Keras
 import os
 import argparse
+import random
+import time
+from pathlib import Path
+from typing import Tuple
 
 import gymnasium as gym
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 import matplotlib.pyplot as plt
-import pandas as pd
 
-import tensorflow as tf
-from tensorflow import keras
-import Box2D  # DO NOT REMOVE
+from gymnasium.wrappers import RecordVideo
 
-# =========================
-# Device Selection (TF CPU/CUDA/Metal)
-# =========================
-gpus = tf.config.list_physical_devices('GPU')
-if len(gpus) > 0:
-    DEVICE = "/GPU:0"   # Works on CUDA + Apple Metal (tf-macos)
-else:
-    DEVICE = "/CPU:0"
-
-print(f"🔧 TensorFlow executing on device: {DEVICE}")
-
-# =========================
-# Reproducibility
-# =========================
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-tf.random.set_seed(SEED)
-
-# =========================
-# Hyperparameters
-# =========================
-def discount_rate():  # Gamma
-    return 1
-
-def batch_size():
-    return 64
-
-# =========================
-# Environment
-# =========================
-envLunar = gym.make('LunarLander-v3')
-envLunar.reset(seed=SEED)
-envLunar.action_space.seed(SEED)
-envLunar.observation_space.seed(SEED)
-
-# =========================
-# Double Deep Q-Network (Keras)
-# =========================
-class DoubleDeepQNetwork():
-    def __init__(self, states, actions, alpha, gamma, epsilon, epsilon_min, epsilon_decay):
-        self.nS = states
-        self.nA = actions
-        self.memory = deque([], maxlen=10000)
-        self.alpha = alpha
-        self.gamma = gamma
-
-        # Explore/Exploit
-        self.epsilon = epsilon
-        self.epsilon_min = epsilon_min
-        self.epsilon_decay = epsilon_decay
-
-        # Networks
-        with tf.device(DEVICE):
-            self.model = self.build_model()
-            self.model_target = self.build_model()
-            self.update_target_from_model()
-
-        # Metrics
-        self.loss = []
-
-    def build_model(self):
-        model = keras.Sequential([
-            keras.layers.Input(shape=(self.nS,)),
-            keras.layers.Dense(128, activation='relu'),
-            keras.layers.Dense(128, activation='relu'),
-            keras.layers.Dense(self.nA, activation='linear'),
-        ])
-        model.compile(
-            loss='mean_squared_error',
-            optimizer=keras.optimizers.Adam(learning_rate=self.alpha)
-        )
-        return model
-
-    def update_target_from_model(self):
-        self.model_target.set_weights(self.model.get_weights())
-
-    def action(self, state):
-        if np.random.rand() <= self.epsilon:
-            return random.randrange(self.nA)
-        with tf.device(DEVICE):
-            q_vals = self.model.predict(state.reshape(1, -1), verbose=0)
-        return int(np.argmax(q_vals[0]))
-
-    def remember(self, state, action, reward, nstate, done):
-        self.memory.append((state, action, reward, nstate, done))
-
-    def experience_replay(self, batch_size):
-        minibatch = random.sample(self.memory, batch_size)
-
-        st = np.zeros((batch_size, self.nS), dtype=np.float32)
-        nst = np.zeros((batch_size, self.nS), dtype=np.float32)
-        act = np.zeros((batch_size,), dtype=np.int32)
-        rew = np.zeros((batch_size,), dtype=np.float32)
-        don = np.zeros((batch_size,), dtype=np.float32)
-
-        for i in range(batch_size):
-            st[i] = minibatch[i][0].reshape(-1, self.nS)
-            nst[i] = minibatch[i][3].reshape(-1, self.nS)
-            act[i], rew[i], don[i] = minibatch[i][1], minibatch[i][2], float(minibatch[i][4])
-
-        with tf.device(DEVICE):
-            q_st = self.model.predict(st, verbose=0)
-            q_nst_online = self.model.predict(nst, verbose=0)
-            q_nst_target = self.model_target.predict(nst, verbose=0)
-
-        for i in range(batch_size):
-            target = q_st[i]
-            if don[i] == 1.0:
-                target[act[i]] = rew[i]
-            else:
-                best_a = np.argmax(q_nst_online[i])
-                target[act[i]] = rew[i] + self.gamma * q_nst_target[i][best_a]
-            q_st[i] = target
-
-        with tf.device(DEVICE):
-            hist = self.model.fit(st, q_st, epochs=1, verbose=0, batch_size=batch_size)
-
-        self.loss.append(hist.history['loss'][0])
-
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
-
-# =========================
-# Create Agent & Train
-# =========================
-
-# Model Folder
-MODEL_DIR = "keras_ddqn_models"
-os.makedirs(MODEL_DIR, exist_ok=True)
-MODEL_PATH = os.path.join(MODEL_DIR, "ddqn_lunarlander_v3.h5")
-
-# CLI Args
-parser = argparse.ArgumentParser(description="Train DDQN on LunarLander-v3 (Keras)")
-parser.add_argument("--total_steps", type=int, default=500)  # episodes
-parser.add_argument("--stage_size", type=int, default=500)   # MAX STEPS PER EPISODE
+# ----------------- CLI Args -----------------
+parser = argparse.ArgumentParser(description="Train DDQN on LunarLander-v3")
+parser.add_argument("--total_steps", type=int, default=400_000)
+parser.add_argument("--stage_size", type=int, default=50_000)
 parser.add_argument("--lr", type=float, default=5e-4)
 args = parser.parse_args()
 
-EPISODES = args.total_steps
-MAX_STEPS = args.stage_size
-LR = args.lr
-TARGET_SYNC_EVERY = 1
-SOLVE_LINE = 200.0
+# ----------------- Hyperparameters -----------------
+ENV_NAME = "LunarLander-v3"
+SEED = 1234
+BUFFER_SIZE = 200_000  
+BATCH_SIZE = 64
+GAMMA = 0.99
+LR = 5e-4              
+TRAIN_EVERY = 1        
+TRAIN_START = 5_000      
+MAX_FRAMES = 400_000
+MAX_EPISODES = 400
+EPS_START = 1.0
+EPS_END = 0.01
+EPS_DECAY_FRAMES = 120_000  
+TARGET_UPDATE = 1500    
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Dimensions
-nS, nA = envLunar.observation_space.shape[0], envLunar.action_space.n
+# Track Metrics
+ALL_REWARDS = []
+ALL_LOSSES = []
 
-# Agent
-dqn = DoubleDeepQNetwork(nS, nA, LR, discount_rate(), epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.910)
+MODEL_DIR = Path("models")
+VIDEO_DIR = os.path.join(MODEL_DIR, "best_video")
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+os.makedirs(VIDEO_DIR, exist_ok=True)
+MODEL_FILE = MODEL_DIR / "ddqn_lunarlander_keras.pth"
+LOG_FILE = Path("ddqn_lunarlander_keras_results.txt")
+MODEL_PATH = os.path.join(MODEL_DIR, "dqn_lunarlander_v3.zip")
+LOSS_CSV = os.path.join(MODEL_DIR, "loss_log.csv")
+REWARD_CSV = os.path.join(MODEL_DIR, "reward_log.csv")
 
-batch = batch_size()
-rewards, epsilons, losses = [], [], []
+# ----------------- Utilities -----------------
 
-for e in range(EPISODES):
-    state, _ = envLunar.reset(seed=SEED + e)
-    total_reward = 0.0
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
 
-    for t in range(MAX_STEPS):
-        action = dqn.action(state)
-        nstate, reward, terminated, truncated, _ = envLunar.step(action)
-        done = terminated or truncated
+# ---------- TERMINATION REASON ----------
+def termination_reason(env, obs):
+    """Detect landing outcome in LunarLander-v3"""
+    um = env.unwrapped
+    try:
+        x_pos = float(obs[0])
+        if getattr(um, "game_over", False):
+            return "CRASH"
+        elif abs(x_pos) >= 2.5:
+            return "OUT_OF_BOUNDS"
+        elif not bool(um.lander.awake):
+            left, right = int(obs[6]), int(obs[7])
+            return "LANDED_OK" if left == 1 and right == 1 else "ASLEEP"
+        else:
+            return "UNKNOWN"
+    except:
+        return "DONE"
 
-        dqn.remember(state, action, reward, nstate, done)
-        if len(dqn.memory) > batch:
-            dqn.experience_replay(batch)
+# ---------- ENV FACTORY ----------
+def make_env(seed=0, record=False, tag=""):
+    env = gym.make(ENV_NAME, render_mode="rgb_array" if record else None)
+    if record:
+        env = RecordVideo(env, VIDEO_DIR, name_prefix=f"best_landing_{tag}")
+    #env = Monitor(env)
+    env.reset(seed=seed)
+    return env
 
-        state = nstate
-        total_reward += reward
+# ----------------- Replay Buffer -----------------
+class ReplayBuffer:
+    def __init__(self, capacity: int):
+        from collections import deque
 
-        if done:
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def sample(self, batch_size: int):
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones = map(np.asarray, zip(*batch))
+        return states, actions, rewards, next_states, dones
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+# ----------------- Q Network -----------------
+class QNetwork(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=nn.init.calculate_gain('relu'))
+                nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ----------------- Agent -----------------
+class DDQNAgent:
+    def __init__(self, state_dim: int, action_dim: int, lr: float = args.lr, buffer_size: int = BUFFER_SIZE):
+        self.action_dim = action_dim
+        self.online = QNetwork(state_dim, action_dim).to(DEVICE)
+        self.target = QNetwork(state_dim, action_dim).to(DEVICE)
+        self.target.load_state_dict(self.online.state_dict())
+        self.optimizer = optim.Adam(self.online.parameters(), lr=lr)
+        self.replay = ReplayBuffer(buffer_size)
+        self.steps = 0
+
+    def act(self, state: np.ndarray, eps: float) -> int:
+        if random.random() < eps:
+            return random.randrange(self.action_dim)
+        state_v = torch.tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+        with torch.no_grad():
+            qvals = self.online(state_v)
+            return int(qvals.argmax(1))
+    def act_greedy(self, obs):
+        # evaluation-time behavior (deterministic)
+        state_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
+        q = self.online(state_t).detach().cpu().numpy()
+        return int(np.argmax(q[0]).item())
+    def train_step(self):
+        if len(self.replay) < BATCH_SIZE:
+            return None
+
+        states, actions, rewards, next_states, dones = self.replay.sample(BATCH_SIZE)
+        states_v = torch.tensor(states, dtype=torch.float32, device=DEVICE)
+        next_states_v = torch.tensor(next_states, dtype=torch.float32, device=DEVICE)
+        actions_v = torch.tensor(actions, dtype=torch.long, device=DEVICE).unsqueeze(1)
+        rewards_v = torch.tensor(rewards, dtype=torch.float32, device=DEVICE).unsqueeze(1)
+        dones_v = torch.tensor(dones.astype(np.uint8), dtype=torch.float32, device=DEVICE).unsqueeze(1)
+
+        q_vals = self.online(states_v).gather(1, actions_v)
+
+        with torch.no_grad():
+            next_q_online = self.online(next_states_v)
+            next_actions = next_q_online.argmax(dim=1, keepdim=True)
+            next_q_target = self.target(next_states_v).gather(1, next_actions)
+            target_q = rewards_v + GAMMA * (1.0 - dones_v) * next_q_target
+
+        loss = F.smooth_l1_loss(q_vals, target_q)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.online.parameters(), 10.0)
+        self.optimizer.step()
+        return float(loss.item())
+
+    def update_target(self):
+        self.target.load_state_dict(self.online.state_dict())
+
+    def save(self, path: Path):
+        torch.save(self.online.state_dict(), str(path))
+
+    def load(self, path: Path):
+        self.online.load_state_dict(torch.load(str(path), map_location=DEVICE))
+        self.target.load_state_dict(self.online.state_dict())
+
+
+# ----------------- Main Training -----------------
+def train(total_steps, stage_size, lr):
+    set_seed(SEED)
+    env = gym.make(ENV_NAME)
+
+    # gymnasium vs gym compatibility for reset
+    try:
+        obs = env.reset(seed=SEED)
+    except TypeError:
+        obs = env.reset()
+
+    # determine state/action sizes
+    state_example = env.observation_space.sample()
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
+
+    agent = DDQNAgent(state_dim, action_dim)
+    episodes = total_steps/1000
+    LOG_FILE.write_text("")
+    episode = 0
+    frame = 0
+    eps = EPS_START
+    best_avg = -1e9
+    start_time = time.time()
+
+    while episode < episodes and frame < total_steps:
+        reset_ret = env.reset()
+        state = reset_ret[0] if isinstance(reset_ret, tuple) else reset_ret
+        ep_reward = 0.0
+        done = False
+
+        while not done and frame < total_steps:
+            frame += 1
+            eps = EPS_END + (EPS_START - EPS_END) * np.exp(-1.0 * frame / EPS_DECAY_FRAMES) * (frame / EPS_DECAY_FRAMES)
+
+            action = agent.act(state, eps)
+            step_ret = env.step(action)
+
+            # gymnasium returns (obs, reward, terminated, truncated, info)
+            if len(step_ret) == 5:
+                next_state, reward, terminated, truncated, info = step_ret
+                done_flag = bool(terminated or truncated)
+            else:
+                next_state, reward, done_flag, info = step_ret
+
+            # improved reward shaping
+            try:
+                # encourage center
+                reward += 1.0 * (1.0 - min(1.0, abs(next_state[0])))
+                # maintain altitude
+                reward += 0.5 * (1.0 - min(1.0, abs(next_state[1])))
+                # stabilize angle
+                reward += 1.0 * (1.0 - min(1.0, abs(next_state[4])))
+                # penalize angular velocity
+                reward -= 0.1 * abs(next_state[5])
+                # leg contact bonus
+                if len(next_state) >= 8:
+                    reward += 5.0 * float(next_state[6])
+                    reward += 5.0 * float(next_state[7])
+            except Exception:
+                pass
+
+            agent.replay.push(state, action, reward, next_state, done_flag)
+            state = next_state
+            ep_reward += reward
+ 
+            if frame > TRAIN_START and frame % TRAIN_EVERY == 0:
+                loss = agent.train_step()
+                if loss is not None:
+                    ALL_LOSSES.append(loss)
+
+            if frame % TARGET_UPDATE == 0:
+                agent.update_target()
+
+            if done_flag:
+                # terminal landing bonus
+                try:
+                    vx, vy = float(next_state[2]), float(next_state[3])
+                    ang = float(next_state[4])
+                    landing_bonus = 50.0 - 20.0 * abs(vy) - 10.0 * abs(ang)
+                    landing_bonus = max(0.0, landing_bonus)
+                    ep_reward += landing_bonus
+                except Exception:
+                    pass
+                break
+
+        ALL_REWARDS.append(ep_reward)
+        avg100 = float(np.mean(ALL_REWARDS[-100:])) if len(ALL_REWARDS) >= 1 else ep_reward
+        line = f"Episode {episode:4d} Frame {frame:6d} Reward {ep_reward:8.2f} AvgRecent {avg100:8.2f}"
+
+        LOG_FILE.write_text(LOG_FILE.read_text() + line)
+        print(line.strip())
+
+        if avg100 > best_avg and avg100 >= 200.0:
+            best_avg = avg100
+            agent.save(MODEL_FILE)
+            print(f"New best avg100 {best_avg:.2f} — model saved: {MODEL_FILE}")
+            print(f"🎥 NEW BEST AVERAGE REWARD {best_avg:.2f} → Recording episode")
+            record_best_video(agent)
+        if (episode*1000) % stage_size == 0:
+            agent.save(MODEL_FILE)
+            print(f"New model saved at step {episode*1000}: {MODEL_FILE}")
+        episode += 1
+
+    env.close()
+    elapsed = time.time() - start_time
+    print(f"Training finished. Frames: {frame}, Episodes: {episode}, Time: {elapsed/60:.2f} min")
+    agent.save(MODEL_FILE)
+    print(f"Saved final model to {MODEL_FILE}")
+
+    # ---------- Save Model ----------
+    os.makedirs("Lunarlander_ddqnkeras_outputs", exist_ok=True)
+    torch.save(agent.online.state_dict(), "Lunarlander_ddqnkeras_outputs/Lunarlander_ddqnkeras.pth")
+
+    # ---------- Save Graphs ----------
+    plt.figure(figsize=(8, 4))
+    plt.plot(ALL_REWARDS, marker="o", alpha=0.7, color="blue")
+    plt.title("📈 Reward Per Episode - DDQN LunarLander (Keras)")
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.grid()
+    plt.tight_layout()
+    plt.savefig("ddqn_outputs/reward_plot.png")
+
+    if ALL_LOSSES:
+        plt.figure(figsize=(8, 4))
+        plt.plot(ALL_LOSSES, marker="o", alpha=0.7, color="red")
+        plt.title("📉 Loss Curve - DDQN LunarLander (Keras)")
+        plt.xlabel("Training Step")
+        plt.ylabel("Loss")
+        plt.grid()
+        plt.tight_layout()
+        plt.savefig("ddqn_outputs/loss_plot.png")
+
+    print("📊 Saved loss & reward plots under ddqn_outputs")
+    return agent, ALL_REWARDS, ALL_LOSSES
+
+# ---------- RECORD BEST VIDEO ----------
+def record_best_video(model):
+    env = make_env(1234, record=True, tag="best")
+    obs, _ = env.reset()
+
+    while True:
+        action = model.act_greedy(obs)
+        obs, _, term, trunc, _ = env.step(action)
+        if term or trunc:
             break
+    env.close()
 
-    rewards.append(total_reward)
-    epsilons.append(dqn.epsilon)
-    losses.append(dqn.loss[-1] if len(dqn.loss) > 0 else np.nan)
+# ----------------- EVALUATION (PRINT SUMMARY) -----------------
+def evaluate_and_report(agent: DDQNAgent, n_eps: int = 20):
+    env = gym.make(ENV_NAME)
+    outcomes = {"LANDED_OK": 0, "CRASH": 0, "OUT_OF_BOUNDS": 0, "ASLEEP": 0, "UNKNOWN": 0, "DONE": 0}
+    rewards = []
 
-    if (e + 1) % TARGET_SYNC_EVERY == 0:
-        dqn.update_target_from_model()
+    for ep in range(n_eps):
+        reset_ret = env.reset()
+        obs = reset_ret[0] if isinstance(reset_ret, tuple) else reset_ret
+        ep_reward = 0.0
+        done = False
+        while not done:
+            with torch.no_grad():
+                state_v = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+                q_vals = agent.online(state_v)
+                action = int(q_vals.argmax(1).item())
 
-    print(f"[Episode {e+1}] reward={total_reward:.2f} epsilon={dqn.epsilon:.3f} last_loss={losses[-1]:.6f}")
+            step_ret = env.step(action)
+            if len(step_ret) == 5:
+                obs, reward, terminated, truncated, info = step_ret
+                done = bool(terminated or truncated)
+            else:
+                obs, reward, done, info = step_ret
 
-# Save Model
-dqn.model.save(MODEL_PATH)
-print(f"💾 Saved model → {MODEL_PATH}")
+            ep_reward += reward
 
-# =========================
-# TEST SUMMARY (NO LEARNING)
-# =========================
-TEST_EPISODES = 20
-test_rewards = []
+            if done:
+                reason = termination_reason(env, obs)
+                outcomes[reason] = outcomes.get(reason, 0) + 1
+                rewards.append(ep_reward)
+                break
+    env.close()
+    
+    print("=== Evaluation Summary ===")
+    for k, v in outcomes.items():
+        print(f"{k:>15}: {v}")
+    print(f"Mean Reward: {np.mean(rewards):.2f} +/- {np.std(rewards):.2f}")
 
-for te in range(TEST_EPISODES):
-    s, _ = envLunar.reset(seed=SEED + 1000 + te)
-    ep_r = 0.0
-    done = False
-    while not done:
-        with tf.device(DEVICE):
-            q_vals = dqn.model.predict(s.reshape(1, -1), verbose=0)
-        a = int(np.argmax(q_vals[0]))
-        s, r, terminated, truncated, _ = envLunar.step(a)
-        done = terminated or truncated
-        ep_r += r
-    test_rewards.append(ep_r)
+    # simple bar plot
+    labels, counts = list(outcomes.keys()), list(outcomes.values())
+    plt.figure(figsize=(6, 4))
+    plt.bar(labels, counts)
+    plt.title("LunarLander Episode Outcomes")
+    plt.tight_layout()
+    plt.savefig(MODEL_DIR / "evaluation_summary.png")
+    print(f"Saved evaluation plot to {MODEL_DIR / 'evaluation_summary.png'}")
 
-print("\n==== 🧪 TEST SUMMARY ====")
-print(f"episodes={TEST_EPISODES}")
-print(f"mean_reward={np.mean(test_rewards):.2f}  std={np.std(test_rewards):.2f}")
-print(f"min_reward={np.min(test_rewards):.2f}  max_reward={np.max(test_rewards):.2f}")
 
-# =========================
-# SAVE Graphs + CSV
-# =========================
-results_df = pd.DataFrame({"reward": rewards, "epsilon": epsilons, "loss": losses})
-results_df.to_csv(os.path.join(MODEL_DIR, "training_data.csv"), index=False)
+# ----------------- Run -----------------
+if __name__ == '__main__':
+    print(f"🚀 Training on {ENV_NAME} | Steps={args.total_steps:,} | LR={args.lr}")
+    agent, rewards, losses = train(args.total_steps, args.stage_size, args.lr)
 
-plt.figure(figsize=(12,5))
-plt.plot(rewards); plt.title("Rewards per Episode"); plt.grid()
-plt.savefig(os.path.join(MODEL_DIR, "reward_plot.png"))
+    # load the saved/best model for evaluation if exists
+    if MODEL_FILE.exists():
+        agent.load(MODEL_FILE)
 
-plt.figure(figsize=(12,4))
-plt.plot(epsilons); plt.title("Epsilon Decay"); plt.grid()
-plt.savefig(os.path.join(MODEL_DIR, "epsilon_plot.png"))
+    evaluate_and_report(agent, n_eps=20)
+    print("🎉 Done!")
+    print("🎉 Done! Video saved in:", VIDEO_DIR)
 
-if not np.all(np.isnan(losses)):
-    plt.figure(figsize=(12,4))
-    plt.plot(losses); plt.title("Training Loss per Episode"); plt.grid()
-    plt.savefig(os.path.join(MODEL_DIR, "loss_plot.png"))
 
-print("📊 Saved all graphs + CSV!")
-print("\n🎉 TRAINING + TEST COMPLETE!\n")
