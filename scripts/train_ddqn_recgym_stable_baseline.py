@@ -234,7 +234,6 @@ if __name__ == "__main__":
     parser.add_argument("--update_target_steps", type=int, default=100)
     parser.add_argument("--total_steps", type=int, default=300_000)
     parser.add_argument("--stage_size", type=int, default=50_000)
-    parser.add_argument("--lr", type=float, default=5e-4)
 
 
     args = parser.parse_args()
