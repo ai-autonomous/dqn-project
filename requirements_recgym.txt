@@ -1,40 +1,38 @@
-# Core numerical + utils
-numpy==1.24.4
-pandas==2.3.3
-scipy==1.15.3
-scikit-learn==1.7.2
+# ---- Core Numerical Stack (compatible together) ----
+numpy==1.26.4          # Manylinux wheel available, no build
+pandas==2.1.4
+scipy==1.12.0
+scikit-learn==1.4.2
 
-# Gym ecosystem
-gymnasium==1.0.0
+# ---- Plotting ----
+matplotlib==3.8.4
+pillow==10.3.0
+
+# ---- Gym Ecosystem ----
+gymnasium==0.29.1
 Farama-Notifications==0.0.4
-cloudpickle==3.1.2
+cloudpickle==3.0.0
 
-# RecSim + Scope-RL (mandatory)
+# ---- RL Frameworks (Stable-Baselines3 + Extras) ----
+stable-baselines3==2.3.2
+shimmy==0.2.1
+tensorboard==2.17.0
+
+# ---- RecSim + Scope-RL (must install AFTER numpy) ----
+absl-py==2.1.0
+dm-tree==0.1.8
+etils==1.8.0
+protobuf==4.25.3
+
+# Installed from source after wheels above exist
 -e git+https://github.com/google-research/recsim.git@55e50e4be736d222ffe8c2477ed1981b40f91605#egg=recsim
 -e git+https://github.com/hakuhodo-technologies/scope-rl.git@b1c9e9fbfddd924362160ec5e9f9f071abc7b7ea#egg=scope_rl
 
-# Core dependencies needed by recsim & scope-rl
-absl-py==2.3.1
-dm-tree==0.1.9
-etils==1.13.0
-protobuf==6.33.1
-
-# Basic support libs
-requests==2.32.5
-pillow==12.0.0
-PyYAML==6.0.3
-typing_extensions==4.15.0
-
-# (Optional but used for plotting in your training script)
-matplotlib==3.10.7
-
-# Logging + formatting (used by recsim/scope-rl)
-rich==14.2.0
-structlog==25.5.0
-
-# Jinja + importlib (some RL libs rely on these indirectly)
-Jinja2==3.1.6
-importlib_resources==6.5.2
-
-# tqdm progress bars
-tqdm==4.67.1
+# ---- Misc Utilities ----
+requests==2.32.3
+PyYAML==6.0.1
+typing_extensions==4.12.2
+importlib_resources==6.1.1
+tqdm==4.66.4
+rich==13.7.1
+structlog==24.1.0
