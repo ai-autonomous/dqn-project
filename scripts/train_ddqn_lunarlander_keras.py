@@ -388,7 +388,7 @@ def evaluate_and_report(agent: DDQNAgent, n_eps: int = 20):
     plt.bar(labels, counts)
     plt.title("LunarLander Episode Outcomes")
     plt.tight_layout()
-    plt.savefig(MODEL_DIR, "evaluation_summary.png")
+    plt.savefig(os.path.join(MODEL_DIR, "evaluation_summary.png"))
 
 
 # ----------------- Run -----------------
