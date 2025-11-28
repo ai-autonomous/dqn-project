@@ -29,7 +29,7 @@ on:
         options:
           - lunarlander
           - cartpole
-          - recsim
+          - recgym
         default: "lunarlander"
 
       total_steps:
@@ -57,11 +57,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 2 — Set up Python
-      - name: Set up Python 3.13
+      - name: Free up disk space on runner
+        run: |
+          echo "📦 Cleaning up space..."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h
+      
+      # -----------------------------
+      # Python version switches here
+      # -----------------------------
+      - name: Set up Python (3.10 for recgym, else 3.13)
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ github.event.inputs.environment == 'recgym' && '3.10' || '3.13' }}
 
       # Step 3 — Install system-level dependencies
       - name: Install system dependencies
@@ -71,7 +83,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install -r requirements.txt
+
+          if [ "${{ github.event.inputs.environment }}" = "recgym" ]; then
+            echo "Using RecGym dependency file: requirements_recgym.txt"
+            pip install -r requirements_recgym.txt
+          else
+            echo "Using default dependency file: requirements.txt"
+            pip install -r requirements.txt
+          fi
 
       # Step 5 — Validation & Print Info
       - name: Validate Inputs & Print System Info
@@ -83,14 +102,6 @@ jobs:
           echo "algorithm: ${{ github.event.inputs.algorithm }}"
           echo "environment: ${{ github.event.inputs.environment }}"
           echo "=== WORKFLOW INPUTS END ==="
-          
-          echo "=== WORKFLOW INPUT VALIDATION ==="
-          if [ "$APPROACH" = "stable_baseline" ] && [ "$ALGO" != "dqn" ]; then
-            echo "❌ Error: Only DQN is supported with Stable Baseline."
-            echo "You selected: $ALGO under approach: $APPROACH"
-            exit 1
-          fi
-          echo "✔️ Input validation passed!"
 
           echo "=== RUNNER SYSTEM INFO ==="
           echo "🖥️ OS Release:"
