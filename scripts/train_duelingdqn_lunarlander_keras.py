@@ -1,450 +1,388 @@
-# -*- coding: utf-8 -*-
-# Dueling DQN (PyTorch) for LunarLander-v3
+# Dueling DQN LunarLander Implementation - Keras
+import os
+import argparse
+import random
+import time
+from pathlib import Path
+from typing import Tuple
+from collections import deque
 
 import gymnasium as gym
 import numpy as np
-import random
-from collections import deque, namedtuple
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers, losses
 import matplotlib.pyplot as plt
-import os
 
-# -------------------- Hyperparameters --------------------
-ENV_NAME = "LunarLander-v3"
-SEED = 42
-GAMMA = 0.99
-N_ATOMS = 51
-V_MIN = -300.0
-V_MAX = 300.0
-N_STEPS = 3
-BUFFER_SIZE = 100_000
-BATCH_SIZE = 64
-LR = 5e-4
-UPDATE_TARGET_EVERY = 500
-TRAIN_START = 1000
-TRAIN_EVERY = 1
-MAX_FRAMES = 400_000
-PRIORITY_ALPHA = 0.6
-PRIORITY_BETA_START = 0.4
-PRIORITY_BETA_FRAMES = 100_000
+from gymnasium.wrappers import RecordVideo
 
-# Track Metrics
-ALL_REWARDS = []
-ALL_LOSSES = []
+# ========= CLI Inputs =========
+parser = argparse.ArgumentParser(description="Train Dueling Double DQN on LunarLander-v3")
+parser.add_argument("--env", type=str, default="LunarLander-v3")
+parser.add_argument("--total_steps", type=int, default=300_000)
+parser.add_argument("--stage_size", type=int, default=50_000)
+parser.add_argument("--lr", type=float, default=1e-4)
+parser.add_argument("--episodes", type=int, default=400)
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--save_path", type=str, default="dueling_dqn_LunarLander_keras")
+parser.add_argument("--buffer_size", type=int, default=80_000)
+parser.add_argument("--eps_start", type=float, default=1.0)
+parser.add_argument("--eps_end", type=float, default=0.05)
+parser.add_argument("--eps_decay_frames", type=int, default=50_000)
+parser.add_argument("--batch_size", type=int, default=64)
+parser.add_argument("--gamma", type=float, default=0.99)
+parser.add_argument("--sync_steps", type=int, default=3000)
+parser.add_argument("--eval_every", type=int, default=50)
+parser.add_argument("--min_buffer", type=int, default=6000)
+parser.add_argument("--train_every", type=int, default=4)
+parser.add_argument("--record_best_video", action="store_true", help="Record video when avg100 >= 200")
+args = parser.parse_args()
 
-# -------------------- Utilities --------------------
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+# ========= Reproducibility =========
+random.seed(args.seed)
+np.random.seed(args.seed)
+tf.random.set_seed(args.seed)
 
-set_seed(SEED)
+MODEL_DIR = Path("models")
+VIDEO_DIR = os.path.join(MODEL_DIR, "best_video")
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+os.makedirs(VIDEO_DIR, exist_ok=True)
+MODEL_FILE = MODEL_DIR / "dueling_dqn_lunarlander_keras.pth"
+LOG_FILE = Path("dueling_dqn_lunarlander_keras_results.txt")
+MODEL_PATH = os.path.join(MODEL_DIR, "dueling_dqn_lunarlander_v3.keras")
+LOSS_CSV = os.path.join(MODEL_DIR, "loss_log.csv")
+REWARD_CSV = os.path.join(MODEL_DIR, "reward_log.csv")
 
-# ---------- TERMINATION REASON ----------
+# ----------------- Utilities -----------------
+def make_env(seed=0, record=False, tag="best"):
+    env = gym.make(args.env, render_mode="rgb_array" if record else None)
+    if record:
+        env = RecordVideo(env, str(VIDEO_DIR), name_prefix=f"best_{tag}")
+    env.reset(seed=seed)
+    return env
+
+
 def termination_reason(env, obs):
-    """Detect landing outcome in LunarLander-v3"""
-    um = env.unwrapped
+    # best effort, robust to gymnasium changes
+    um = getattr(env, "unwrapped", None)
     try:
         x_pos = float(obs[0])
-        if getattr(um, "game_over", False):
+        if hasattr(um, "game_over") and bool(getattr(um, "game_over", False)):
             return "CRASH"
         elif abs(x_pos) >= 2.5:
             return "OUT_OF_BOUNDS"
-        elif not bool(um.lander.awake):
-            left, right = int(obs[6]), int(obs[7])
-            return "LANDED_OK" if left == 1 and right == 1 else "ASLEEP"
-        else:
-            return "UNKNOWN"
-    except:
+        # legs contacts: obs[6], obs[7] if present
+        left = int(obs[6]) if len(obs) > 6 else 0
+        right = int(obs[7]) if len(obs) > 7 else 0
+        # sleeping/landed heuristic via velocity/angle
+        if left == 1 and right == 1:
+            return "LANDED_OK"
+        return "UNKNOWN"
+    except Exception:
         return "DONE"
 
-# -------------------- Noisy Linear --------------------
-class NoisyLinear(nn.Module):
-    def __init__(self, in_features, out_features, sigma_init=0.5):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
-        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
-        self.register_buffer('weight_epsilon', torch.empty(out_features, in_features))
-        self.bias_mu = nn.Parameter(torch.empty(out_features))
-        self.bias_sigma = nn.Parameter(torch.empty(out_features))
-        self.register_buffer('bias_epsilon', torch.empty(out_features))
-        self.sigma_init = sigma_init
-        self.reset_parameters()
-        self.reset_noise()
+# ========= Replay Buffer =========
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
 
-    def reset_parameters(self):
-        mu_range = 1 / math.sqrt(self.in_features)
-        self.weight_mu.data.uniform_(-mu_range, mu_range)
-        self.weight_sigma.data.fill_(self.sigma_init / math.sqrt(self.in_features))
-        self.bias_mu.data.uniform_(-mu_range, mu_range)
-        self.bias_sigma.data.fill_(self.sigma_init / math.sqrt(self.out_features))
+    def push(self, s, a, r, ns, d):
+        self.buffer.append((s, a, r, ns, d))
 
-    def _scale_noise(self, size):
-        x = torch.randn(size)
-        return x.sign().mul_(x.abs().sqrt_())
-
-    def reset_noise(self):
-        epsilon_in = self._scale_noise(self.in_features)
-        epsilon_out = self._scale_noise(self.out_features)
-        self.weight_epsilon.copy_(epsilon_out.ger(epsilon_in))
-        self.bias_epsilon.copy_(epsilon_out)
-
-    def forward(self, x):
-        if self.training:
-            weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
-            bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
-        else:
-            weight = self.weight_mu
-            bias = self.bias_mu
-        return F.linear(x, weight, bias)
-
-# -------------------- Dueling C51 Network --------------------
-class RainbowC51(nn.Module):
-    def __init__(self, state_dim, action_dim, atoms=N_ATOMS):
-        super().__init__()
-        self.action_dim = action_dim
-        self.atoms = atoms
-
-        self.fc1 = nn.Linear(state_dim, 256)
-        self.fc2 = nn.Linear(256, 256)
-
-        self.val_fc = NoisyLinear(256, 128)
-        self.val_out = NoisyLinear(128, atoms)
-
-        self.adv_fc = NoisyLinear(256, 128)
-        self.adv_out = NoisyLinear(128, action_dim * atoms)
-
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-
-        v = F.relu(self.val_fc(x))
-        v = self.val_out(v).view(-1, 1, self.atoms)
-
-        a = F.relu(self.adv_fc(x))
-        a = self.adv_out(a).view(-1, self.action_dim, self.atoms)
-
-        q_atoms = v + a - a.mean(1, keepdim=True)
-        dist = F.softmax(q_atoms, dim=2)
-        dist = dist.clamp(min=1e-6)
-        return dist
-
-    def reset_noise(self):
-        self.val_fc.reset_noise(); self.val_out.reset_noise()
-        self.adv_fc.reset_noise(); self.adv_out.reset_noise()
-
-# -------------------- PER + N-step --------------------
-class PrioritizedReplayNstep:
-    def __init__(self, capacity, n_step=N_STEPS, gamma=GAMMA, alpha=PRIORITY_ALPHA):
-        self.capacity = capacity
-        self.n_step = n_step
-        self.gamma = gamma
-        self.alpha = alpha
-        
-        self.buffer = []
-        self.pos = 0
-        self.priorities = np.zeros((capacity,), dtype=np.float32)
-
-        self.nstep_queue = deque(maxlen=n_step)
-        self.Transition = namedtuple('Transition', ['s', 'a', 'r', 'ns', 'd'])
-
-    def _get_n_step_info(self):
-        reward, next_state, done = 0, None, None
-        for idx, (_, _, r, ns, d) in enumerate(self.nstep_queue):
-            reward += (self.gamma ** idx) * r
-            next_state = ns
-            done = d
-            if d:
-                break
-        return reward, next_state, done
-
-    def push(self, state, action, reward, next_state, done):
-        self.nstep_queue.append((state, action, reward, next_state, done))
-        if len(self.nstep_queue) < self.n_step:
-            return
-        s, a, _, _, _ = self.nstep_queue[0]
-        R, ns, d = self._get_n_step_info()
-        transition = self.Transition(s, a, R, ns, d)
-        max_prio = self.priorities.max() if self.buffer else 1.0
-
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(transition)
-        else:
-            self.buffer[self.pos] = transition
-
-        self.priorities[self.pos] = max_prio
-        self.pos = (self.pos + 1) % self.capacity
-
-    def sample(self, batch_size, beta=0.4):
-        if len(self.buffer) == 0:
-            return None
-
-        prios = self.priorities[:len(self.buffer)]
-        prios = np.maximum(prios, 1e-6)
-        probs = prios ** self.alpha
-        probs /= probs.sum()
-
-        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
-        samples = [self.buffer[i] for i in indices]
-        batch = self.Transition(*zip(*samples))
-
-        weights = (len(self.buffer) * probs[indices]) ** (-beta)
-        weights /= weights.max()
-
-        states = torch.tensor(np.array(batch.s), dtype=torch.float32)
-        actions = torch.tensor(batch.a, dtype=torch.long)
-        rewards = torch.tensor(batch.r, dtype=torch.float32)
-        next_states = torch.tensor(np.array(batch.ns), dtype=torch.float32)
-        dones = torch.tensor(batch.d, dtype=torch.float32)
-
-        return states, actions, rewards, next_states, dones, indices, torch.tensor(weights, dtype=torch.float32)
-
-    def update_priorities(self, indices, priorities):
-        for idx, p in zip(indices, priorities):
-            self.priorities[idx] = p
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        s, a, r, ns, d = map(np.array, zip(*batch))
+        return (s.astype(np.float32),
+                a.astype(np.int32),
+                r.astype(np.float32),
+                ns.astype(np.float32),
+                d.astype(np.float32))
 
     def __len__(self):
         return len(self.buffer)
 
-# -------------------- Distributional projection (C51) --------------------
-def projection_distribution(next_dist, rewards, dones, gamma):
-    batch_size = rewards.size(0)
-    proj_dist = torch.zeros((batch_size, N_ATOMS), dtype=torch.float32)
-    delta_z = float(V_MAX - V_MIN) / (N_ATOMS - 1)
-    support = torch.linspace(V_MIN, V_MAX, N_ATOMS)
+# ========= Dueling Q Network (Dueling Architecture) =========
+def build_dueling_q_network(state_dim, action_dim):
+    inputs = layers.Input(shape=(state_dim,), dtype=tf.float32)
+    
+    # Shared Layers
+    x = layers.Dense(256, activation="relu", kernel_initializer='he_uniform')(inputs)
+    x = layers.Dense(128, activation="relu", kernel_initializer='he_uniform')(x)
 
-    rewards = rewards.unsqueeze(1)  # (B,1)
-    dones = dones.unsqueeze(1)      # (B,1)
+    # Value Stream (V(s))
+    val_stream = layers.Dense(128, activation="relu", kernel_initializer='he_uniform')(x)
+    value = layers.Dense(1, activation=None, kernel_initializer='he_uniform', name='value_output')(val_stream) 
 
-    # Tz: (B, atoms)
-    Tz = rewards + gamma * support.unsqueeze(0) * (1.0 - dones)
-    Tz = Tz.clamp(min=V_MIN, max=V_MAX)
+    # Advantage Stream (A(s, a))
+    adv_stream = layers.Dense(128, activation="relu", kernel_initializer='he_uniform')(x)
+    advantage = layers.Dense(action_dim, activation=None, kernel_initializer='he_uniform', name='advantage_output')(adv_stream) 
 
-    b = (Tz - V_MIN) / delta_z
-    l = b.floor().long()
-    u = b.ceil().long()
+    # Combine (Q(s,a) = V(s) + A(s,a) - mean(A(s,a')) )
+    
+    # 1. Calculate the mean of Advantage (Shape: (None, 1))
+    mean_advantage = layers.Lambda(lambda a: tf.reduce_mean(a, axis=1, keepdims=True),
+                                   output_shape=(1,), name='mean_advantage')(advantage)
+    
+    # 2. Negate the mean Advantage (Shape: (None, 1))
+    # This correctly performs the * (-1) operation on a tensor.
+    negated_mean_advantage = layers.Lambda(lambda a: a * -1.0, name='negated_mean_advantage')(mean_advantage) 
+    
+    # 3. Add the three components (V + A + (-mean(A)))
+    # Note: Keras Add layer handles broadcasting of (None, 1) and (None, action_dim)
+    q_values = layers.Add()([value, advantage, negated_mean_advantage])
 
-    l = l.clamp(0, N_ATOMS - 1)
-    u = u.clamp(0, N_ATOMS - 1)
+    model = models.Model(inputs=inputs, outputs=q_values)
+    return model
 
-    offset = (torch.arange(batch_size) * N_ATOMS).unsqueeze(1)
-
-    proj = torch.zeros((batch_size * N_ATOMS,))
-    next_dist_flat = next_dist.reshape(-1)
-
-    eq_mask = (u == l)
-    if eq_mask.any():
-        idxs = (l + offset).view(-1)[eq_mask.view(-1)]
-        proj.index_add_(0, idxs, next_dist_flat[eq_mask.view(-1)])
-
-    ne_mask = ~eq_mask
-    if ne_mask.any():
-        l_idxs = (l + offset).view(-1)[ne_mask.view(-1)]
-        u_idxs = (u + offset).view(-1)[ne_mask.view(-1)]
-        b_flat = b.view(-1)[ne_mask.view(-1)]
-        dist_flat = next_dist_flat[ne_mask.view(-1)]
-        proj.index_add_(0, l_idxs, dist_flat * (u.view(-1)[ne_mask.view(-1)].float() - b_flat))
-        proj.index_add_(0, u_idxs, dist_flat * (b_flat - l.view(-1)[ne_mask.view(-1)].float()))
-
-    proj = proj.view(batch_size, N_ATOMS)
-    return proj
-
-    for i in range(batch_size):
-        for j in range(N_ATOMS):
-            Tz = rewards[i].item() + (gamma * support[j].item()) * (1.0 - dones[i].item())
-            Tz = max(V_MIN, min(V_MAX, Tz))
-            b = (Tz - V_MIN) / delta_z
-            l = math.floor(b)
-            u = math.ceil(b)
-            if l == u:
-                proj_dist[i, l] += next_dist[i, j]
-            else:
-                proj_dist[i, l] += next_dist[i, j] * (u - b)
-                proj_dist[i, u] += next_dist[i, j] * (b - l)
-    return proj_dist
-
-# -------------------- Agent / Training Loop --------------------
-class RainbowAgent:
-    def __init__(self, state_dim, action_dim, device):
-        self.device = device
+# ----------------- Agent -----------------
+class DuelingAgent:
+    def __init__(self, state_dim, action_dim, lr, gamma, batch_size):
         self.action_dim = action_dim
-        self.z = torch.linspace(V_MIN, V_MAX, N_ATOMS).to(device)
-        self.delta_z = (V_MAX - V_MIN) / (N_ATOMS - 1)
+        self.gamma = gamma
+        self.batch_size = batch_size
 
-        self.online = RainbowC51(state_dim, action_dim).to(device)
-        self.target = RainbowC51(state_dim, action_dim).to(device)
-        self.target.load_state_dict(self.online.state_dict())
-        self.optimizer = optim.Adam(self.online.parameters(), lr=LR)
+        # Use the Dueling Network here
+        self.online = build_dueling_q_network(state_dim, action_dim)
+        self.target = build_dueling_q_network(state_dim, action_dim)
+        self.target.set_weights(self.online.get_weights())
 
-        self.replay = PrioritizedReplayNstep(BUFFER_SIZE)
-        self.beta_start = PRIORITY_BETA_START
-        self.beta_frames = PRIORITY_BETA_FRAMES
-        self.frame_idx = 0
+        self.optimizer = optimizers.Adam(learning_rate=lr)
+        self.loss_fn = losses.Huber()
 
-    def select_action(self, state):
-        state_v = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            dist = self.online(state_v)
-            q_vals = torch.sum(dist * self.z, dim=2)
-            action = q_vals.argmax(1).item()
-        return action
+    def act(self, obs, eps):
+        if random.random() < eps:
+            return random.randrange(self.action_dim)
+        q = self.online(np.array([obs], dtype=np.float32))
+        return int(tf.argmax(q[0]).numpy())
 
-    def train_step(self):
-        if len(self.replay) < BATCH_SIZE:
+    def train_step(self, replay: ReplayBuffer):
+        if len(replay) < self.batch_size:
             return None
-        self.frame_idx += 1
-        beta = min(1.0, self.beta_start + (1.0 - self.beta_start) * (self.frame_idx / float(self.beta_frames)))
-        samples = self.replay.sample(BATCH_SIZE, beta)
-        if samples is None:
-            return None
-        states, actions, rewards, next_states, dones, idxs, weights = samples
-        states = states.to(self.device)
-        next_states = next_states.to(self.device)
-        actions = actions.to(self.device)
-        rewards = rewards.to(self.device)
-        dones = dones.to(self.device)
-        weights = weights.to(self.device)
 
-        with torch.no_grad():
-            next_dist = self.online(next_states)
-            next_q = torch.sum(next_dist * self.z, dim=2)
-            next_actions = next_q.argmax(1)
-            next_dist_target = self.target(next_states)
-            next_dist_target_a = next_dist_target[range(BATCH_SIZE), next_actions]
+        states, actions, rewards, next_states, dones = replay.sample(self.batch_size)
 
-            proj_dist = projection_distribution(next_dist_target_a, rewards, dones, GAMMA ** N_STEPS)
-            proj_dist = proj_dist.to(self.device)
+        # Double DQN targets (Logic remains the same, as the Dueling network still outputs Q-values)
+        next_q_online = self.online(next_states).numpy()          
+        next_actions = np.argmax(next_q_online, axis=1)               
+        next_q_target = self.target(next_states).numpy()              
+        target_q = rewards + args.gamma * next_q_target[np.arange(self.batch_size), next_actions] * (1.0 - dones)
 
-        dist = self.online(states)
-        dist_a = dist[range(BATCH_SIZE), actions]
+        # Train online network
+        with tf.GradientTape() as tape:
+            q_values = self.online(states)                           
+            action_mask = tf.one_hot(actions, self.action_dim, dtype=tf.float32)
+            chosen_q = tf.reduce_sum(q_values * action_mask, axis=1)     
+            loss = self.loss_fn(target_q, chosen_q)
 
-        loss = - (proj_dist * dist_a.log()).sum(1)
-        loss = (weights * loss).mean()
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-        with torch.no_grad():
-            expected = torch.sum(dist_a * self.z, dim=1)
-            target_expected = torch.sum(proj_dist * self.z, dim=1)
-            td_errors = (expected - target_expected).abs().cpu().numpy()
-        self.replay.update_priorities(idxs, td_errors + 1e-6)
-
-        self.online.reset_noise(); self.target.reset_noise()
-        return loss.item()
+        grads = tape.gradient(loss, self.online.trainable_variables)
+        grads = [tf.clip_by_norm(g, 10.0) if g is not None else None for g in grads]
+        self.optimizer.apply_gradients(zip(grads, self.online.trainable_variables))
+        return float(loss.numpy())
 
     def update_target(self):
-        self.target.load_state_dict(self.online.state_dict())
+        self.target.set_weights(self.online.get_weights())
 
-# -------------------- Main Training --------------------
-def train(episodes=800):
-    env = gym.make(ENV_NAME, disable_env_checker=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def save(self, path: Path):
+        self.online.save(str(path))
+
+    def load(self, path: Path):
+        self.online = tf.keras.models.load_model(str(path))
+        self.target.set_weights(self.online.get_weights())
+
+
+# ----------------- Main Training -----------------
+def train(args):
+    # Ensure plots directory is defined and created inside the function
+    # to avoid the NameError from the previous turn
+    PLOTS_DIR = Path("plots") 
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Env and dims
+    env = gym.make(args.env)
+    try:
+        reset_ret = env.reset(seed=args.seed)
+        obs0 = reset_ret[0] if isinstance(reset_ret, tuple) else reset_ret
+    except TypeError:
+        reset_ret = env.reset()
+        obs0 = reset_ret[0] if isinstance(reset_ret, tuple) else reset_ret
+
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
-    agent = RainbowAgent(state_dim, action_dim, device)
+    agent = DuelingAgent(state_dim, action_dim, lr=args.lr, gamma=args.gamma, batch_size=args.batch_size)
+    replay = ReplayBuffer(capacity=args.buffer_size)
 
-    frame = 0
-    for ep in range(episodes):
-        state, _ = env.reset()
-        ep_reward = 0
-        done = False
+    # Warmup
+    obs = obs0
+    for _ in range(args.min_buffer):
+        a = env.action_space.sample()
+        step_ret = env.step(a)
+        if len(step_ret) == 5:
+            next_obs, r, term, trunc, info = step_ret
+            done = bool(term or trunc)
+        else:
+            next_obs, r, done, info = step_ret
+        replay.push(obs, a, r, next_obs, float(done))
+        obs = next_obs if not done else env.reset(seed=args.seed)[0]
 
-        while not done:
-            action = agent.select_action(state)
-            next_state, reward, terminated, truncated, _ = env.step(action)
-            done_flag = terminated or truncated
-            scaled_reward = float(reward) / 10.0
-            agent.replay.push(state, action, scaled_reward, next_state, done_flag)
+    print(f"Warmup complete: replay size = {len(replay)}")
+
+    # Metrics
+    ALL_REWARDS = []
+    ALL_LOSSES = []
+    best_avg100 = -np.inf
+    frames = 0
+    episodes = 0
+    start = time.time()
+
+    # Training
+    while episodes < args.episodes and frames < args.total_steps:
+        reset_ret = env.reset(seed=args.seed + episodes)
+        state = reset_ret[0] if isinstance(reset_ret, tuple) else reset_ret
+        ep_reward = 0.0
+
+        while True and frames < args.total_steps:
+            frames += 1
+            # epsilon schedule (exponential w/ floor)
+            frac = min(1.0, frames / args.eps_decay_frames)
+            eps = args.eps_end + (args.eps_start - args.eps_end) * np.exp(-3.0 * frac)
+
+            action = agent.act(state, eps)
+            step_ret = env.step(action)
+            if len(step_ret) == 5:
+                next_state, reward, term, trunc, info = step_ret
+                done = bool(term or trunc)
+            else:
+                next_state, reward, done, info = step_ret
+
+            replay.push(state, action, reward, next_state, float(done))
             state = next_state
             ep_reward += reward
-            frame += 1
 
-            if frame > TRAIN_START:
-                loss = agent.train_step()
+            if frames % args.train_every == 0:
+                loss = agent.train_step(replay)
                 if loss is not None:
                     ALL_LOSSES.append(loss)
 
-            if frame % UPDATE_TARGET_EVERY == 0:
+            if frames % args.sync_steps == 0:
                 agent.update_target()
 
-            if done_flag:
+            if done:
                 break
 
         ALL_REWARDS.append(ep_reward)
-        print(f"Episode {ep} Frame {frame} Reward {ep_reward}")
+        episodes += 1
+
+        avg100 = float(np.mean(ALL_REWARDS[-100:]))
+        print(f"Ep {episodes:4d} | Frame {frames:7d} | EpR {ep_reward:8.2f} | Avg100 {avg100:8.2f} | eps~{eps:.3f}")
+
+        # Save best & optionally record
+        if avg100 > best_avg100:
+            best_avg100 = avg100
+            agent.save(MODEL_PATH)
+            print(f"New best avg100 {best_avg100:.2f} — model saved at {MODEL_PATH}")
+            if args.record_best_video and avg100 >= 200.0:
+                print("Recording best video...")
+                record_best_video(agent, tag="best")
+
+        # Append log
+        with open(LOG_FILE, "a") as f:
+            f.write(f"Ep {episodes} Frame {frames} Reward {ep_reward:.2f} Avg100 {avg100:.2f}\n")
 
     env.close()
+    elapsed = (time.time() - start) / 60.0
+    print(f"Training finished. Frames={frames}, Episodes={episodes}, Time={elapsed:.2f} min")
 
-    # ---------- Save Model ----------
-    os.makedirs("rainbow_outputs", exist_ok=True)
-    torch.save(agent.online.state_dict(), "rainbow_outputs/rainbow_c51_lunar_v3.pth")
+    # Final save
+    agent.save(MODEL_PATH)
+    print(f"Saved final model to {MODEL_PATH}")
 
-    # ---------- Save Graphs ----------
+    # Plots
     plt.figure(figsize=(8, 4))
-    plt.plot(ALL_REWARDS, marker="o", alpha=0.7, color="blue")
-    plt.title("?? Reward Per Episode - Rainbow")
+    plt.plot(ALL_REWARDS, alpha=0.8, color="blue")
+    plt.title("Reward Per Episode - Dueling Network DQN LunarLander (Keras)")
     plt.xlabel("Episode")
     plt.ylabel("Reward")
-    plt.grid()
+    plt.grid(True)
     plt.tight_layout()
-    plt.savefig("rainbow_outputs/reward_plot.png")
+    plt.savefig(PLOTS_DIR / "reward_plot.png")
 
     if ALL_LOSSES:
+        avg_loss = np.mean(ALL_LOSSES)
+        print(f"Average Training Loss: {avg_loss:.5f}")
         plt.figure(figsize=(8, 4))
-        plt.plot(ALL_LOSSES, marker="o", alpha=0.7, color="red")
-        plt.title("?? Loss Curve - Rainbow DQN")
+        plt.plot(ALL_LOSSES, alpha=0.8, color="red")
+        plt.title("Loss Curve - Dueling Network DQN LunarLander (Keras)")
         plt.xlabel("Training Step")
         plt.ylabel("Loss")
-        plt.grid()
+        plt.grid(True)
         plt.tight_layout()
-        plt.savefig("rainbow_outputs/loss_plot.png")
+        plt.savefig(PLOTS_DIR / "loss_plot.png")
 
-    print("?? Saved loss & reward plots under rainbow_outputs")
+    print(f"Saved plots to {PLOTS_DIR}")
+    return agent, ALL_REWARDS, ALL_LOSSES
 
-    return agent
-
-# ---------- EVALUATION (PRINT SUMMARY) ----------
-def evaluate_and_report(agent, n_eps=20):
-    env = gym.make(ENV_NAME)
-    outcomes = {"LANDED_OK": 0, "CRASH": 0, "OUT_OF_BOUNDS": 0, "ASLEEP": 0, "UNKNOWN": 0, "DONE": 0}
-    rewards = []
-
-    for ep in range(n_eps):
-        obs, _ = env.reset()
-        ep_reward = 0
-        while True:
-            with torch.no_grad():
-                state_v = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
-                dist = agent.online(state_v)
-                q_vals = torch.sum(dist * agent.z, dim=2)
-                action = q_vals.argmax(1).item()
-
-            obs, reward, term, trunc, _ = env.step(action)
-            ep_reward += reward
-
-            if term or trunc:
-                reason = termination_reason(env, obs)
-                outcomes[reason] += 1
-                rewards.append(ep_reward)
-                break
-
+# ---------- RECORD BEST VIDEO ----------
+def record_best_video(agent: DuelingAgent, tag="best"):
+    env = make_env(seed=args.seed, record=True, tag=tag)
+    obs, _ = env.reset()
+    while True:
+        q_vals = agent.online(np.array([obs], dtype=np.float32))
+        action = int(tf.argmax(q_vals[0]).numpy())
+        obs, _, term, trunc, _ = env.step(action)
+        if term or trunc:
+            break
     env.close()
 
-    print("\n=== Evaluation Summary ===")
+# ----------------- EVALUATION (PRINT SUMMARY) -----------------
+def evaluate_and_report(agent: DuelingAgent, n_eps: int = 20):
+    env = gym.make(args.env)
+    outcomes = {"LANDED_OK": 0, "CRASH": 0, "OUT_OF_BOUNDS": 0, "UNKNOWN": 0, "DONE": 0}
+    rewards = []
+
+    for _ in range(n_eps):
+        reset_ret = env.reset(seed=args.seed)
+        obs = reset_ret[0] if isinstance(reset_ret, tuple) else reset_ret
+        ep_r = 0.0
+        while True:
+            q_vals = agent.online(np.array([obs], dtype=np.float32))
+            action = int(tf.argmax(q_vals[0]).numpy())
+            step_ret = env.step(action)
+            if len(step_ret) == 5:
+                obs, reward, term, trunc, info = step_ret
+                done = bool(term or trunc)
+            else:
+                obs, reward, done, info = step_ret
+            ep_r += reward
+            if done:
+                reason = termination_reason(env, obs)
+                outcomes[reason] = outcomes.get(reason, 0) + 1
+                rewards.append(ep_r)
+                break
+    env.close()
+
+    print("=== Evaluation Summary ===")
     for k, v in outcomes.items():
         print(f"{k:>15}: {v}")
     print(f"Mean Reward: {np.mean(rewards):.2f} +/- {np.std(rewards):.2f}")
 
-# -------------------- Run --------------------
-if __name__ == '__main__':
-    agent = train(episodes=400)
+    # Plot outcomes
+    labels, counts = list(outcomes.keys()), list(outcomes.values())
+    plt.figure(figsize=(6, 4))
+    plt.bar(labels, counts)
+    plt.title("LunarLander Episode Outcomes")
+    plt.tight_layout()
+    plt.savefig(MODEL_DIR / "evaluation_summary.png")
+    print(f"Saved evaluation plot to {MODEL_DIR / 'evaluation_summary.png'}")
+	
+# ----------------- Run -----------------
+if __name__ == "__main__":
+    print(f"🚀 Training Dueling Network DQN (Keras) Episodes={args.episodes} | Frames={args.total_steps:,} | LR={args.lr}")
+    agent, rewards, losses = train(args)
+    # Load best for evaluation, if saved
+    if Path(MODEL_PATH).exists():
+        try:
+            agent.load(MODEL_PATH)
+        except Exception as e:
+            print(f"Could not load best model for final evaluation: {e}")
     evaluate_and_report(agent, n_eps=20)
+    print("🎉 Done!")
